@@ -1,0 +1,7 @@
+
+opencv-python
+numpy
+ultralytics
+torch
+supervision>=0.18.0
+PyYAML>=6.0

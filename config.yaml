@@ -1,0 +1,78 @@
+# Lane Violation Detection Configuration
+
+paths:
+  vehicle_model: "yolov8n.pt"
+  output_dir: "outputs"
+  csv_log: "outputs/violations.csv"
+  annotated_video: "outputs/annotated_lane_violation.mp4"
+
+input:
+  source: "Traffic_3_lane_cut.mp4"
+  frame_decimation: "auto"
+  target_process_fps: 12
+  force_fps: 0
+
+vehicle_detection:
+  confidence_threshold: 0.35
+  iou_threshold: 0.45
+  target_classes: [2, 3, 5, 7]
+  input_size: 640
+
+bytetrack:
+  track_activation_threshold: 0.35
+  lost_track_buffer: "auto"
+  minimum_matching_threshold: 0.75
+  frame_rate: 30
+
+lane_zone:
+  # Yellow lane guide polygon points (P1, P2, P3, P4)
+  # Points were defined on a 960x540 reference view and are auto-scaled
+  # to the actual source frame resolution.
+  reference_resolution: [1440, 1080]
+  points:
+    - [700, 260]
+    - [550, 260]
+    - [700, 890]
+    - [1390, 700]
+
+motion:
+  history_size: 20
+  stale_after_frames: 90
+
+violation:
+  # A track needs enough lane-zone history to avoid noisy decisions
+  min_inside_points: 5
+  min_displacement_px: 30
+  min_progress_px: 20
+
+  # Direction score is cosine similarity with lane direction vector
+  # negative means moving against legal direction
+  opposite_score_threshold: -0.15
+
+  # Secondary violation: appears near P1-P2 side and does not move forward
+  forbidden_entry_progress_ratio: 0.55
+  forbidden_entry_max_forward_px: 15
+
+display:
+  show_window: true
+  window_name: "Lane Violation Detection"
+  fixed_window_size: true
+  window_width: 1280
+  window_height: 720
+  display_scale: 0.7
+  fps_window: 30
+  line_thickness: 2
+  draw_lane_points: true
+
+  lane_polygon_color: [0, 255, 255]
+  bbox_color_normal: [0, 255, 0]
+  bbox_color_out_of_lane: [255, 180, 0]
+  bbox_color_violation: [0, 0, 255]
+
+output:
+  save_annotated_video: true
+
+logging:
+  level: "INFO"
+  log_to_console: true
+  log_file: "outputs/pipeline.log"

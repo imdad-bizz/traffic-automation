@@ -1,0 +1,33 @@
+# Python Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Pipeline Outputs & Run Artifacts
+outputs/
+*.log
+
+# Video & Media Files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Deep Learning Weights
+*.pt
+*.pth
+*.onnx
+*.weights
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
