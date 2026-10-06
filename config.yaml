@@ -68,12 +68,15 @@ plate:
 
 # Lane Zone definition
 lane_zone:
-  reference_resolution: [1440, 1080]
+  # Yellow lane guide polygon points (P1, P2, P3, P4)
+  # Points were defined on a 960x540 reference view and are auto-scaled
+  # to the actual source frame resolution.
+  reference_resolution: [2560, 1440]
   points:
-    - [700, 260]
-    - [550, 260]
-    - [700, 890]
-    - [1390, 700]
+    - [300, 1000]
+    - [1300, 1260]
+    - [2000, 500]
+    - [1600, 400]
 
 motion:
   history_size: 20
