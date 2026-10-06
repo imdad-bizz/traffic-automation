@@ -58,6 +58,8 @@ class LaneViolationPipeline:
             return "WRONG-WAY"
         if reason == "forbidden_entry_side":
             return "ENTRY-VIOL"
+        if reason == "speeding":
+            return "SPEEDING"
         return "VIOLATION"
 
     def run(self) -> None:
@@ -133,6 +135,7 @@ class LaneViolationPipeline:
                             frame_idx=frame_idx,
                             lane_zone=self.lane_zone,
                             motion_tracker=self.motion_tracker,
+                            fps=ingester.processing_fps,
                         )
 
                     existing_event = self.violation_detector.get_event(track_id)

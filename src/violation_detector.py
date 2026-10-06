@@ -14,6 +14,7 @@ class ViolationEvent:
     progress_delta: float
     centroid: tuple[int, int]
     bbox: tuple[int, int, int, int]
+    speed_kmh: float = 0.0
 
 
 class ViolationDetector:
@@ -25,6 +26,9 @@ class ViolationDetector:
 
     Secondary violation:
       - Suspicious entry from the forbidden side (P1-P2 side).
+      
+    Speed violation:
+      - Exceeding the speed limit in the lane.
     """
 
     def __init__(self, cfg: dict) -> None:
@@ -35,6 +39,11 @@ class ViolationDetector:
         self._opposite_score_threshold = float(vcfg["opposite_score_threshold"])
         self._forbidden_entry_progress_ratio = float(vcfg["forbidden_entry_progress_ratio"])
         self._forbidden_entry_max_forward_px = float(vcfg["forbidden_entry_max_forward_px"])
+        
+        # Speed params
+        self._lane_length_meters = float(vcfg.get("lane_length_meters", 30.0))
+        self._speed_limit_kmh = float(vcfg.get("speed_limit_kmh", 60.0))
+        self._min_frames_for_speed = int(vcfg.get("min_frames_for_speed", 10))
 
         self._flagged: dict[int, ViolationEvent] = {}
 
@@ -55,6 +64,7 @@ class ViolationDetector:
         frame_idx: int,
         lane_zone,
         motion_tracker,
+        fps: float,
     ) -> ViolationEvent | None:
         if track_id in self._flagged:
             return None
@@ -79,6 +89,7 @@ class ViolationDetector:
             return None
 
         reason: str | None = None
+        speed_kmh = 0.0
 
         if direction_score <= self._opposite_score_threshold or progress_delta <= -self._min_progress_px:
             reason = "opposite_direction"
@@ -90,6 +101,19 @@ class ViolationDetector:
                 and progress_delta <= self._forbidden_entry_max_forward_px
             ):
                 reason = "forbidden_entry_side"
+            elif len(inside_points) >= self._min_frames_for_speed and fps > 0:
+                start_frame = motion_tracker.get_start_frame(track_id)
+                if start_frame is not None and frame_idx > start_frame:
+                    time_elapsed = (frame_idx - start_frame) / fps
+                    lane_len_px = getattr(lane_zone.geometry, "length_px", 1.0) or 1.0
+                    norm_progress = abs(progress_delta) / max(1.0, float(lane_len_px))
+                    dist_meters = norm_progress * self._lane_length_meters
+                    if time_elapsed > 0.2 and dist_meters > 2.0:
+                        speed_ms = dist_meters / time_elapsed
+                        calculated_speed = speed_ms * 3.6
+                        if calculated_speed > self._speed_limit_kmh:
+                            reason = "speeding"
+                            speed_kmh = calculated_speed
 
         if reason is None:
             return None
@@ -102,6 +126,7 @@ class ViolationDetector:
             progress_delta=progress_delta,
             centroid=centroid,
             bbox=bbox,
+            speed_kmh=speed_kmh,
         )
         self._flagged[track_id] = event
         return event

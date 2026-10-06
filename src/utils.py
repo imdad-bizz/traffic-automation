@@ -25,9 +25,6 @@ def load_config(config_path: str = "config.yaml") -> dict:
         "input",
         "vehicle_detection",
         "bytetrack",
-        "lane_zone",
-        "motion",
-        "violation",
         "display",
         "output",
         "logging",
@@ -217,19 +214,31 @@ def draw_tracked_vehicle(
     if subtitle:
         label = f"{label} {subtitle}"
 
-    (lw, lh), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-    top = max(0, y1 - lh - baseline - 6)
-    cv2.rectangle(frame, (x1, top), (x1 + lw + 6, y1), draw_color, -1)
-    cv2.putText(
-        frame,
-        label,
-        (x1 + 3, y1 - baseline - 3),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (0, 0, 0),
-        2,
-        cv2.LINE_AA,
-    )
+    is_unicode = any(ord(c) > 127 for c in label)
+    if is_unicode:
+        draw_bilingual_text(
+            frame,
+            label,
+            (x1, max(0, y1 - 26)),
+            font_size=18,
+            color=(0, 0, 0),
+            bg_color=draw_color,
+        )
+    else:
+        (lw, lh), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        top = max(0, y1 - lh - baseline - 6)
+        cv2.rectangle(frame, (x1, top), (x1 + lw + 6, y1), draw_color, -1)
+        cv2.putText(
+            frame,
+            label,
+            (x1 + 3, y1 - baseline - 3),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
 
 
 def draw_hud(
@@ -280,3 +289,93 @@ def resize_to_fit(frame: np.ndarray, max_width: int, max_height: int) -> np.ndar
     out_w = max(1, int(round(width * scale)))
     out_h = max(1, int(round(height * scale)))
     return cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+
+BN_TO_EN_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+
+
+def to_english_digits(text: str) -> str:
+    """Translates Bengali numeral characters to English digits (০-৯ -> 0-9)."""
+    return text.translate(BN_TO_EN_DIGITS)
+
+
+_font_cache = {}
+
+
+def draw_bilingual_text(
+    frame: np.ndarray,
+    text: str,
+    position: tuple[int, int],
+    font_size: int = 20,
+    color: tuple[int, int, int] = (0, 255, 0),
+    bg_color: tuple[int, int, int] | None = None,
+) -> np.ndarray:
+    """Draws text on an OpenCV frame with full Unicode/Bengali support using Pillow.
+    
+    If text only contains ASCII characters and no background is required, uses cv2.putText
+    for speed. If Bengali characters are present, uses Windows Nirmala font.
+    """
+    if not text:
+        return frame
+
+    # Check for non-ASCII characters
+    is_unicode = any(ord(c) > 127 for c in text)
+
+    if not is_unicode and bg_color is None:
+        cv2.putText(
+            frame,
+            text,
+            position,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_size / 30.0,
+            _as_bgr(color),
+            2,
+            cv2.LINE_AA,
+        )
+        return frame
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        if font_size not in _font_cache:
+            font_path = "C:/Windows/Fonts/Nirmala.ttc"
+            if Path(font_path).exists():
+                _font_cache[font_size] = ImageFont.truetype(font_path, font_size)
+            else:
+                _font_cache[font_size] = ImageFont.load_default()
+        font = _font_cache[font_size]
+
+        # Convert OpenCV BGR to Pillow RGB
+        rgb_img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb_img)
+        draw = ImageDraw.Draw(pil_img)
+
+        x, y = position
+        b, g, r = _as_bgr(color)
+        text_color_rgb = (r, g, b)
+
+        if bg_color is not None:
+            bb, bg, br = _as_bgr(bg_color)
+            bg_rgb = (br, bg, bb)
+            bbox = draw.textbbox((x, y), text, font=font)
+            # Add padding
+            draw.rectangle((bbox[0] - 4, bbox[1] - 2, bbox[2] + 4, bbox[3] + 2), fill=bg_rgb)
+
+        draw.text((x, y), text, font=font, fill=text_color_rgb)
+        res = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        np.copyto(frame, res)
+        return frame
+    except Exception as e:
+        logger.debug("[draw_bilingual_text] Fallback to cv2.putText: %s", e)
+        cv2.putText(
+            frame,
+            to_english_digits(text),
+            position,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            _as_bgr(color),
+            2,
+            cv2.LINE_AA,
+        )
+        return frame
+

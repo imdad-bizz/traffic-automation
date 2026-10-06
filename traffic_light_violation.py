@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import logging
+import threading
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,17 +12,24 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
 from src.tracker import build_detector_and_tracker
 from src.utils import (
     FPSCounter,
     FrameIngester,
     draw_hud,
     draw_tracked_vehicle,
+    draw_bilingual_text,
     load_config,
     resize_for_display,
     resize_to_fit,
     setup_logging,
 )
+from src.plate_detector import LicensePlateDetector, BanglaPlateOCR
 
 logger = logging.getLogger(__name__)
 
@@ -161,10 +170,13 @@ class LightSignalDetector:
 
 class TrafficViolationReporter:
     CSV_HEADERS = [
+        "pc_date",
+        "pc_time",
         "timestamp_sec",
         "frame_idx",
         "track_id",
         "signal_color",
+        "plate_text",
         "x1",
         "y1",
         "x2",
@@ -172,9 +184,10 @@ class TrafficViolationReporter:
         "snapshot_path",
     ]
 
-    def __init__(self, csv_path: Path, snapshot_dir: Path) -> None:
+    def __init__(self, csv_path: Path, snapshot_dir: Path, cfg: dict | None = None) -> None:
         self._csv_path = csv_path
         self._snapshot_dir = snapshot_dir
+        self.cfg = cfg or {}
 
         self._csv_path.parent.mkdir(parents=True, exist_ok=True)
         self._snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -182,6 +195,22 @@ class TrafficViolationReporter:
         self._csv_file = None
         self._writer: csv.DictWriter | None = None
         self._saved_track_ids: set[int] = set()
+
+        self._plate_detector = None
+        self._plate_ocr = None
+        try:
+            plate_model = self.cfg.get("plate", {}).get("model_path", "models/plate_detector.pt")
+            if Path(plate_model).exists():
+                self._plate_detector = LicensePlateDetector(model_path=plate_model)
+                easyocr_models = self.cfg.get("paths", {}).get("easyocr_models_dir", "models/EasyOCR/models")
+                easyocr_user = self.cfg.get("paths", {}).get("easyocr_user_network_dir", "models/EasyOCR/user_network")
+                self._plate_ocr = BanglaPlateOCR(
+                    custom_model_dir=easyocr_models,
+                    user_network_dir=easyocr_user,
+                    use_gpu=bool(self.cfg.get("plate", {}).get("use_gpu", False)),
+                )
+        except Exception as e:
+            logger.warning("[TrafficViolationReporter] Could not init ALPR: %s", e)
 
     def open(self) -> None:
         write_header = not self._csv_path.exists() or self._csv_path.stat().st_size == 0
@@ -213,42 +242,79 @@ class TrafficViolationReporter:
         if self._writer is None or self._csv_file is None:
             raise RuntimeError("TrafficViolationReporter is not open")
 
-        snapshot = self._crop_vehicle(frame, event.bbox, padding=12)
+        snapshot = self._crop_vehicle(frame, event.bbox, padding=16)
         if snapshot is None:
             snapshot = frame.copy()
 
-        cv2.putText(
-            snapshot,
+        plate_text = ""
+        best_plate_crop = None
+        best_plate_conf = 0.0
+
+        if self._plate_detector is not None and self._plate_ocr is not None:
+            plates = self._plate_detector.detect_in_vehicle_crop(
+                snapshot, (0, 0, snapshot.shape[1], snapshot.shape[0])
+            )
+            for p in plates:
+                if p.cropped_plate is not None and p.cropped_plate.size > 0:
+                    text, conf = self._plate_ocr.recognize(p.cropped_plate)
+                    if conf > best_plate_conf:
+                        best_plate_conf = conf
+                        plate_text = text
+                        best_plate_crop = p.cropped_plate
+
+        if best_plate_crop is not None and best_plate_crop.size > 0:
+            sh, sw = snapshot.shape[:2]
+            target_pw = min(sw // 2, 220)
+            if target_pw > 40:
+                scale = target_pw / float(best_plate_crop.shape[1])
+                target_ph = max(20, int(best_plate_crop.shape[0] * scale))
+                zoomed_p = cv2.resize(best_plate_crop, (target_pw, target_ph), interpolation=cv2.INTER_CUBIC)
+                cv2.rectangle(zoomed_p, (0, 0), (target_pw - 1, target_ph - 1), (0, 255, 255), 2)
+                px = max(0, sw - target_pw - 6)
+                py = 6
+                if py + target_ph < sh and px + target_pw < sw:
+                    snapshot[py : py + target_ph, px : px + target_pw] = zoomed_p
+
+        info_lines = [
             f"ID:{event.track_id}",
-            (8, 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            snapshot,
             "RED-LIGHT VIOLATION",
-            (8, 48),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
+        ]
+        if plate_text:
+            info_lines.append(f"PLATE: {plate_text}")
+
+        y_offset = 12
+        for line in info_lines:
+            color = (0, 0, 255) if "VIOLATION" in line else (0, 255, 0)
+            draw_bilingual_text(snapshot, line, (8, y_offset), font_size=18, color=color, bg_color=(0, 0, 0))
+            y_offset += 24
 
         snapshot_name = f"track_{event.track_id}_frame_{event.frame_idx}.png"
         snapshot_path = self._snapshot_dir / snapshot_name
         cv2.imwrite(str(snapshot_path), snapshot)
 
+        # Non-blocking audio beep alert
+        if winsound is not None:
+            def _play_beep():
+                try:
+                    winsound.Beep(1200, 250)
+                except Exception:
+                    pass
+            threading.Thread(target=_play_beep, daemon=True).start()
+
+        now_dt = datetime.datetime.now()
+        pc_date = now_dt.strftime("%Y-%m-%d")
+        pc_time = now_dt.strftime("%H:%M:%S")
+
         x1, y1, x2, y2 = event.bbox
         self._writer.writerow(
             {
+                "pc_date": pc_date,
+                "pc_time": pc_time,
                 "timestamp_sec": f"{event.timestamp_sec:.3f}",
                 "frame_idx": event.frame_idx,
                 "track_id": event.track_id,
                 "signal_color": event.signal_color,
+                "plate_text": plate_text,
                 "x1": x1,
                 "y1": y1,
                 "x2": x2,
@@ -430,6 +496,7 @@ class TrafficLightViolationPipeline:
         self._reporter = TrafficViolationReporter(
             csv_path=Path(args.csv),
             snapshot_dir=Path(args.snapshots_dir),
+            cfg=cfg,
         )
 
         self._save_video = bool(cfg["output"].get("save_annotated_video", True))

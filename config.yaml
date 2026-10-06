@@ -1,13 +1,17 @@
-# Lane Violation Detection Configuration
+# Bangladeshi ALPR, Speed & Traffic Violation Monitoring Configuration
 
 paths:
   vehicle_model: "yolov8n.pt"
+  plate_model: "models/plate_detector.pt"
+  easyocr_models_dir: "models/EasyOCR/models"
+  easyocr_user_network_dir: "models/EasyOCR/user_network"
   output_dir: "outputs"
-  csv_log: "outputs/violations.csv"
-  annotated_video: "outputs/annotated_lane_violation.mp4"
+  csv_log: "outputs/detections.csv"
+  db_log: "outputs/detections.db"
+  annotated_video: "outputs/annotated_plate_speed.mp4"
 
 input:
-  source: "Traffic_3_lane_cut.mp4"
+  source: "cctv_footage.mp4"
   frame_decimation: "auto"
   target_process_fps: 12
   force_fps: 0
@@ -15,7 +19,7 @@ input:
 vehicle_detection:
   confidence_threshold: 0.35
   iou_threshold: 0.45
-  target_classes: [2, 3, 5, 7]
+  target_classes: [2, 3, 5, 7]   # car, motorbike, bus, truck
   input_size: 640
 
 bytetrack:
@@ -24,10 +28,46 @@ bytetrack:
   minimum_matching_threshold: 0.75
   frame_rate: 30
 
+# Speed estimation (Perspective Homography IPM calibration)
+speed:
+  method: "homography"   # "homography" (calibrated metric ground plane) or "pixel_ratio"
+  speed_limit_kmh: 60.0
+  speed_tolerance_kmh: 5.0      # Grace buffer to prevent false alarms near limit (60+5=65 km/h)
+  min_track_frames: 8           # Min total frames before evaluating speed
+  min_sustained_frames: 6       # Min consecutive or sustained readings over limit
+  min_measurement_y: 260        # Ignore horizon area (y < 260) to eliminate perspective compression spikes
+  window_duration_sec: 0.5
+  pixels_per_meter: 25.0
+  source_polygon:
+    - [750, 180]    # top-left
+    - [1350, 180]   # top-right
+    - [1850, 980]   # bottom-right
+    - [450, 980]    # bottom-left
+  ground_width_meters: 8.0      # 2-lane roadway width (~3.6-4.0m per lane)
+  ground_length_meters: 30.0    # visible road stretch from y=180 to y=980 (30m)
+
+# Sound & Visual Alerts
+alerts:
+  beep_enabled: true
+  beep_frequency_hz: 1200
+  beep_duration_ms: 250
+  banner_duration_sec: 2.5
+
+# OpenAI GPT AI Vision Configuration for License Plate Post-Processing
+ai:
+  openai_api_key: ""            # Set your OpenAI API key here or via OPENAI_API_KEY environment variable
+  gpt_model: "gpt-4o-mini"       # or "gpt-4o" for maximum OCR reasoning
+
+# Bangladeshi License Plate ALPR
+plate:
+  model_path: "models/plate_detector.pt"
+  detection_conf: 0.20
+  read_interval_frames: 3   # run plate localization & OCR every N frames per track
+  min_confidence: 0.18
+  use_gpu: false
+
+# Lane Zone definition
 lane_zone:
-  # Yellow lane guide polygon points (P1, P2, P3, P4)
-  # Points were defined on a 960x540 reference view and are auto-scaled
-  # to the actual source frame resolution.
   reference_resolution: [1440, 1080]
   points:
     - [700, 260]
@@ -40,22 +80,16 @@ motion:
   stale_after_frames: 90
 
 violation:
-  # A track needs enough lane-zone history to avoid noisy decisions
   min_inside_points: 5
   min_displacement_px: 30
   min_progress_px: 20
-
-  # Direction score is cosine similarity with lane direction vector
-  # negative means moving against legal direction
   opposite_score_threshold: -0.15
-
-  # Secondary violation: appears near P1-P2 side and does not move forward
   forbidden_entry_progress_ratio: 0.55
   forbidden_entry_max_forward_px: 15
 
 display:
   show_window: true
-  window_name: "Lane Violation Detection"
+  window_name: "Bangladeshi ALPR & Speed Monitoring"
   fixed_window_size: true
   window_width: 1280
   window_height: 720

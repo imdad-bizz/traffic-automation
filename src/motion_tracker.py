@@ -43,6 +43,15 @@ class MotionTracker:
             return []
         return [point for _, point, inside_lane in state.history if inside_lane]
 
+    def get_start_frame(self, track_id: int) -> int | None:
+        state = self._states.get(track_id)
+        if state is None or not state.history:
+            return None
+        for frame_idx, _, inside_lane in state.history:
+            if inside_lane:
+                return frame_idx
+        return None
+
     def get_displacement(self, track_id: int) -> np.ndarray | None:
         points = self.get_inside_points(track_id)
         if len(points) < 2:
