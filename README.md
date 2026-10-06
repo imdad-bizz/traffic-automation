@@ -148,3 +148,5 @@ All outputs are saved in the `outputs/` directory:
 5. **Violation Audio & Visual Alerts**: Triggers a non-blocking audio beep alert (`winsound.Beep` on Windows in a daemon thread) and displays a prominent on-screen HUD warning banner whenever a speeding, lane, or red-light violation occurs.
 6. **Finetuned Speeding Validation**: Recalibrated homography IPM parameters (30m road stretch), horizon jitter filtering ($y < 260$), median trajectory speed calculation, and a configurable 5 km/h tolerance buffer to prevent false-positive speeding flags on normal traffic.
 
+#   b a n g l a d e s h i - t r a f f i c - a l p r  
+ 
