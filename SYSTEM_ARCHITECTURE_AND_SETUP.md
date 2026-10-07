@@ -8,11 +8,13 @@
 This repository contains an enterprise-grade Computer Vision and Deep Learning traffic surveillance system engineered specifically for Bangladeshi roadway conditions. The system integrates real-time vehicle detection and multi-object tracking, specialized Bengali license plate localization and OCR, calibrated perspective homography speed estimation, directional lane discipline enforcement, red-light violation detection, and an executive evidence-reporting suite.
 
 Key capabilities include:
-- **Optical-Approach Plate Harvesting**: Preserves maximum-resolution, unblurred plate crops when vehicles reach their closest distance to the camera instead of prematurely capturing low-resolution horizon crops.
+- **Unified Multi-Task Orchestration**: Centralized orchestrator [main.py](file:///d:/traffic-automation/main.py) manages all tasks (`all`, `lane`, `speed`, `plate`, `traffic_light`, `excel`), while preserving independent standalone scripts for modular microservice deployments.
+- **Optical-Approach Plate Harvesting**: Preserves maximum-resolution, unblurred plate crops when vehicles reach their closest optical distance to the camera instead of prematurely capturing low-resolution horizon crops.
 - **Deep Image Enhancement**: Employs bicubic upscaling, bilateral denoising, CLAHE contrast stretching in LAB color space, and unsharp masking.
 - **Local Neural & Cloud AI OCR**: Dual-engine recognition combining a local PyTorch `bn_license_tps` EasyOCR network with an offline OpenAI GPT-4o Vision engine tailored to Bangladesh Road Transport Authority (BRTA) standards.
-- **Finetuned Speed Estimation**: Perspective Inverse Perspective Mapping (IPM) homography with horizon jitter suppression ($y < 260$), median trajectory velocity calculation, and grace tolerance buffers to eliminate false-positive speeding flags.
-- **Real-Time Alerting**: Non-blocking audio beeps (`winsound.Beep` on background threads) and glowing visual HUD warning banners.
+- **Calibrated Speed Estimation**: Perspective Inverse Perspective Mapping (IPM) homography with horizon jitter suppression ($y < 260$), median trajectory velocity calculation, and grace tolerance buffers to eliminate false-positive speeding flags.
+- **Dynamic Resolution Auto-Scaling**: Geometry points and polygons defined on reference frames automatically scale to ingested camera resolutions (720p, 1080p, 4K).
+- **Real-Time Alerting**: Non-blocking audio beeps (`winsound.Beep` on background threads on Windows, terminal bell fallback on Linux) and glowing visual HUD warning banners.
 - **Executive Relational Reporting**: Automated generation of master Excel workbooks containing KPI dashboard summary cards, 18 relational data columns, embedded visual image thumbnails, and direct file hyperlinks with graceful file-lock fallback recovery.
 - **Host PC Clock Synchronization**: Precision timestamping referencing the operating system's real-time clock (`YYYY-MM-DD` and `HH:MM:SS`).
 
@@ -22,45 +24,46 @@ Key capabilities include:
 
 ```mermaid
 flowchart TD
-    A[CCTV / Drone / Live RTSP Stream] --> B[Frame Ingestion & Decimation Engine]
-    B --> C[YOLOv8 Vehicle Detector]
-    C --> D[ByteTrack Multi-Object Tracker]
+    A[CCTV / Drone / Live RTSP Stream] --> B[FrameIngester: Smart Decimation Engine]
+    B --> C[VehicleDetector: YOLOv8 Object Detection]
+    C --> D[ByteTrack: Multi-Object Persistent Tracker]
     
-    subgraph Tracking & Spatial Analysis
-        D --> E[Centroid Trajectory History]
-        E --> F[Perspective Homography IPM Speed Estimator]
-        E --> G[Lane Polygon & Directional Vector Evaluator]
-        E --> H[Stop-Strip Red Light Crossing Evaluator]
+    subgraph Spatial Analytics
+        D --> E[MotionTracker: Centroid Trajectory History]
+        E --> F[PerspectiveSpeedEstimator: 4-Point Homography IPM]
+        E --> G[LaneZone & ViolationDetector: Directional Flow Vector]
+        E --> H[TrafficLightPipeline: Signal ROI + Stop-Strip State Machine]
     end
 
     subgraph Plate Detection & Enhancement
         D --> I[YOLO License Plate Detector models/plate_detector.pt]
-        I --> J[Dynamic Sharpness & Resolution Scorer]
-        J --> K[Clear Plate Image Preprocessor CLAHE + Bilateral + Sharpen]
-        K --> L[Local Bengali EasyOCR bn_license_tps]
+        I --> J[Dynamic Sharpness & Optical Proximity Scorer]
+        J --> K[Clear Plate Image Preprocessor: CLAHE + Bilateral + Sharpen]
+        K --> L[TrackPlateManager: Non-Blocking Background Queue]
+        L --> M[Local Bengali EasyOCR bn_license_tps]
     end
 
     subgraph Violation Verification & Alerts
-        F --> M{Violation Check?}
-        G --> M
-        H --> M
-        M -->|Confirmed Violation| N[Non-Blocking Audio Beep Alert winsound daemon]
-        M -->|Confirmed Violation| O[On-Screen Glowing HUD Alert Banner]
+        F --> N{Violation Check?}
+        G --> N
+        H --> N
+        N -->|Confirmed Violation| O[Thread-Safe Audio Beep Alert winsound daemon]
+        N -->|Confirmed Violation| P[On-Screen Glowing HUD Alert Banner]
+        N -->|Confirmed Violation| Q[ViolationReporter: Composite Evidence Snapshot]
     end
 
     subgraph Storage & Reporting Suite
-        M --> P[SQLite Database outputs/detections.db]
-        M --> Q[CSV Real-Time Log outputs/detections.csv]
-        M --> R[High-Res Snapshots & Crops outputs/plate_crops]
-        P --> S[Executive Excel Exporter openpyxl]
-        R --> S
-        S --> T[Master Excel Report outputs/traffic_violations_alpr.xlsx]
+        Q --> R[(SQLite DB: outputs/detections.db)]
+        Q --> S[CSV Real-Time Log: outputs/detections.csv]
+        M --> R
+        R --> T[ExcelExporter: openpyxl Executive Report]
+        T --> U[Master Excel Report outputs/traffic_violations_alpr.xlsx]
     end
 
     subgraph Offline Cloud AI Engine
-        R -.-> U[OpenAI GPT-4o Vision Post-Processor process_crops.py]
-        U -.-> P
-        U -.-> S
+        Q -.-> V[OpenAI GPT-4o Vision Post-Processor process_crops.py]
+        V -.-> R
+        V -.-> T
     end
 ```
 
@@ -70,12 +73,12 @@ flowchart TD
 
 ### 3.1. Optical-Approach Clear Number Plate Snapshots
 - **Challenge**: Vehicles entering the camera view at the top of the frame appear small ($<30\text{ px}$ wide) and blurry due to camera distance and perspective distortion.
-- **Solution**: The `TrackPlateManager` maintains continuous track records across all frames. Each time a plate is localized by `models/plate_detector.pt`, the crop is evaluated using:
+- **Solution**: The [TrackPlateManager](file:///d:/traffic-automation/src/plate_detector.py#L484) maintains continuous track records across all frames. Each time a plate is localized by `models/plate_detector.pt`, the crop is evaluated using:
   1. **Bounding Box Area**: $Area = w \times h$
   2. **Laplacian Variance Sharpness**: $S = \text{Var}(\nabla^2(I))$
 - **Closest Optical Distance**: The crop with the highest optical clarity and resolution is continuously retained. When the vehicle reaches the foreground ($y \ge 750$), the plate is 3–4× larger.
 - **Preprocessing Pipeline** (`PlatePreprocessor.enhance_for_display`):
-  - Bicubic upscaling to a standardized reading resolution ($220 \times 80\text{ px}$).
+  - Dynamic bicubic upscaling to a standardized reading resolution ($220 \times 80\text{ px}$ or $300 \times 120\text{ px}$).
   - Bilateral filter denoising ($d=5, \sigma_{\text{color}}=40, \sigma_{\text{space}}=40$) to preserve sharp edges while smoothing camera sensor noise.
   - CLAHE (Contrast Limited Adaptive Histogram Equalization) applied to the Luminance channel ($L$) in LAB color space (`clipLimit=2.5, tileGridSize=(8,8)`).
   - Unsharp masking ($I_{\text{sharp}} = 1.4 \times I - 0.4 \times \text{GaussianBlur}(I)$) to enhance alphanumeric embossing.
@@ -92,32 +95,51 @@ flowchart TD
 1. **Local Neural OCR** (`models/EasyOCR/user_network/bn_license_tps`):
    - Custom Transformation-Prediction-Sequence (TPS-ResNet-BiLSTM-CTC) architecture.
    - Character dictionary includes Bengali numerals (`০-৯`), metro names (ঢাকা, চট্টগ্রাম, সিলেট, etc.), and vehicle class characters (ক, খ, গ, ঘ, চ, ছ, জ, ঝ, ত, থ, ঢ, ড, প, ভ, ম, হ, ল).
+   - Seamless fallback: If custom network weights are not found, falls back automatically to standard EasyOCR Bengali reader (`~/.EasyOCR/model/bengali.pth`).
 2. **Offline OpenAI GPT-4o Vision Post-Processor** (`src/gpt_plate_reader.py`):
    - Designed for difficult, tilted, or partially shaded license plates.
    - Structured JSON prompt enforces BRTA standard syntax:
      - Metro / Region: `[City] METRO`
      - Class Letter: `[Class Letter]`
      - Number: `XX-XXXX`
-   - Activated automatically via `python process_crops.py --gpt --api-key <YOUR_KEY>`.
-   - Graceful fallback: If no key is provided, the pipeline logs an informational notice and preserves local OCR results without failing.
+   - Activated automatically via `python main.py --mode excel` or `python process_crops.py`.
+   - Graceful offline fallback: Passing `--no-gpt` runs full local OCR and Excel export with zero external API calls.
 
-### 3.4. Finetuned Speed Estimation & Horizon Spike Rejection
+### 3.4. Calibrated Speed Estimation & Horizon Spike Rejection
 - **Inverse Perspective Mapping (IPM) Homography**:
   Transforms image plane coordinates $[u, v, 1]^T$ into metric ground plane coordinates $[X, Y, 1]^T$ via homography matrix $H$:
   $$H = \text{findHomography}(P_{\text{src}}, P_{\text{dst}})$$
 - **Calibrated Dimensions**:
   - Visible roadway stretch: $30.0\text{ m}$ (4 standard dashed lane dividers at 3m stripe + 6m gap).
   - Road width: $8.0\text{ m}$ (2 standard lanes).
-- **Enriched Validation Logic**:
+- **Validation Logic**:
   1. **Horizon Filtering**: Detections with $y < 260$ are ignored for speed estimation. At the vanishing point, 1 pixel corresponds to $>1.5\text{ m}$, meaning 1 pixel of detection wobble produces $>80\text{ km/h}$ artificial spikes.
-  2. **Median Speed Over History**: Replaces single-frame peak spikes with the median velocity across the valid measurement zone.
+  2. **Median Speed Over History**: Replaces single-frame peak spikes with the rolling median velocity across the valid measurement zone.
   3. **Minimum Travel Distance**: Requires vehicles to travel at least $4.0\text{ m}$ within the calibrated zone before speed is accepted.
   4. **Grace Tolerance Buffer**: A configurable buffer (`speed_tolerance_kmh: 5.0`) prevents false alarms near the threshold (e.g., $60 + 5 = 65\text{ km/h}$).
-  5. **Normalization Fix**: Normalizes pixel displacement against the lane zone physical length.
+  5. **Dynamic Resolution Auto-Scaling**: Scales calibration polygon coordinates if the video resolution differs from `reference_resolution: [2046, 1080]`.
 
-### 3.5. Executive Relational Excel Evidence Export
+### 3.5. Directional Lane Discipline & Wrong-Way Enforcement
+- **LaneZone Polygon**: 4-point convex quadrilateral with points ordered:
+  - $P_1$: Exit Left, $P_2$: Exit Right, $P_3$: Entry Right, $P_4$: Entry Left.
+- **Flow Vector**: Legal direction unit vector $\vec{u}_{\text{legal}}$ points from entry midpoint to exit midpoint.
+- **Infraction Logic**:
+  - **Opposite Direction**: Cosine similarity $\frac{\vec{v} \cdot \vec{u}_{\text{legal}}}{\|\vec{v}\| \|\vec{u}_{\text{legal}}\|} < -0.2$.
+  - **Forbidden Exit Entry**: Flags vehicles entering the zone through the exit boundary line ($P_1 \to P_2$).
+
+### 3.6. Traffic Light Stop-Strip Violation
+- **Signal ROI Color Classifier**:
+  - Defines polygon ROI over signal head (`traffic_light.light_box_points`).
+  - Converts ROI to HSV color space and applies red, yellow, and green chrominance masks.
+  - Dominant color ratio determines active signal phase.
+- **Stop-Strip Intersection State Machine**:
+  - Stop line is dilated by `strip_half_width` (default 34 px) into a polygonal strip.
+  - Vehicle bounding-box bottom center anchor is tracked across frames.
+  - If a vehicle enters or traverses the strip during a **RED** signal phase, a red-light violation is instantly logged.
+
+### 3.7. Executive Relational Excel Evidence Export
 - Built using `openpyxl` with an executive corporate layout:
-  - **KPI Summary Cards** (Rows 2–4): Total Monitored, Violations Recorded, Compliance Rate %, Enforcement Parameters & PC Clock Generation Time.
+  - **KPI Summary Cards** (Rows 2–4): Total Vehicles Monitored, Speed Violations, Lane Violations, Red Light Violations, Compliance Rate %, and Generation Timestamp.
   - **18 Relational Columns**:
     1. `Record ID` (`REC-001`)
     2. `Violation Date (PC)` (`YYYY-MM-DD`)
@@ -140,8 +162,8 @@ flowchart TD
 - **File-Lock Fallback Handler**:
   When an Excel file is open in Microsoft Excel, Windows locks the file (`PermissionError: [Errno 13]`). The exporter catches this error and automatically writes to a timestamped file (`traffic_violations_alpr_YYYYMMDD_HHMMSS.xlsx`), ensuring zero data loss.
 
-### 3.6. Audio & Visual Notification Alerts
-- **Audio Beep**: Employs Windows `winsound.Beep(frequency=1200, duration=250)` executed in a background daemon thread (`threading.Thread(target=..., daemon=True).start()`), guaranteeing zero latency or frame stutter in the video feed.
+### 3.8. Audio & Visual Notification Alerts
+- **Audio Beep**: Employs non-blocking, thread-safe [trigger_beep](file:///d:/traffic-automation/src/utils.py#L18) executed in a background daemon thread with debouncing. Native `winsound.Beep(1200, 250)` on Windows, terminal bell fallback on Linux.
 - **Visual Alert**: Draws a glowing crimson HUD banner across the top of the video feed with the violating track ID, offense type, and speed.
 
 ---
@@ -152,22 +174,25 @@ flowchart TD
 traffic-automation/
 │
 ├── config.yaml                       # Master configuration (thresholds, geometry, models, alerts)
-├── main.py                           # Unified CLI entry point for all modes
+├── main.py                           # Master CLI orchestrator (runs any or all modes)
 ├── plate_speed_pipeline.py           # Core ALPR, speed monitoring & live alerting pipeline
-├── process_crops.py                  # Offline high-accuracy OCR, GPT-4o Vision & Excel generator
-├── pipeline.py                       # Directional lane discipline enforcement pipeline
-├── traffic_light_violation.py        # Stop-strip red-light violation pipeline
+├── wrong_lane_violation.py           # Dedicated standalone lane & wrong-way violation pipeline
+├── speed_violation.py                # Dedicated standalone IPM speed estimation pipeline
+├── license_plate_capture.py          # Dedicated standalone plate detector & harvester
+├── traffic_light_violation.py        # Dedicated standalone red-light stop-line pipeline
+├── process_crops.py                  # Offline multi-scale plate OCR & GPT-4o post-processor
+├── export_excel.py                   # Standalone Excel audit workbook generator
+├── pipeline.py                       # Backward-compatibility alias for lane violation pipeline
 ├── requirements.txt                  # Python dependencies
-├── cctv_footage.mp4                  # Sample 60 FPS surveillance video footage
+├── cctv_footage.mp4                  # Primary benchmark CCTV footage (2046x1080 @ 60 FPS)
+├── light_cut.mp4                     # Traffic light benchmark footage (1920x1080 @ 30 FPS)
 ├── reference_frame.jpg               # Geometry reference frame for polygon calibration
 ├── SYSTEM_ARCHITECTURE_AND_SETUP.md  # Complete engineering architecture & setup guide
-├── README.md                         # Quick-start documentation
+├── README.md                         # Quick-start developer guide & reference
 │
 ├── models/
-│   ├── plate_detector.pt             # Trained YOLO license plate detector (22.5 MB)
+│   ├── plate_detector.pt             # Trained YOLO license plate detector (6.2 MB)
 │   └── EasyOCR/
-│       ├── models/
-│       │   └── bn_license_tps.pth    # Bengali license plate recognition weights (83.8 MB)
 │       └── user_network/
 │           ├── bn_license_tps.py     # PyTorch custom neural network architecture
 │           ├── bn_license_tps.yaml   # Architecture configuration and character set
@@ -177,8 +202,9 @@ traffic-automation/
 │   ├── __init__.py
 │   ├── excel_exporter.py             # Executive openpyxl workbook generator with embedded images
 │   ├── gpt_plate_reader.py           # OpenAI GPT-4o Vision client with BRTA schema parsing
+│   ├── lane_zone.py                  # 4-point lane polygon geometry & resolution scaling
 │   ├── motion_tracker.py             # Centroid trajectory history & smoothing
-│   ├── plate_detector.py             # Plate preprocessing, tracking & local EasyOCR engine
+│   ├── plate_detector.py             # LicensePlateDetector, BanglaPlateOCR, TrackPlateManager
 │   ├── speed_estimator.py            # Calibrated perspective homography IPM speed estimator
 │   ├── tracker.py                    # YOLOv8 vehicle detector & ByteTrack multi-object tracker
 │   ├── utils.py                      # Frame decimation ingester, bilingual text rendering & HUD
@@ -188,10 +214,10 @@ traffic-automation/
 └── outputs/                          # (Generated during execution)
     ├── annotated_plate_speed.mp4     # Annotated surveillance video output
     ├── traffic_violations_alpr.xlsx  # Master executive Excel report with embedded images
-    ├── detections.db                 # Relational SQLite database
+    ├── detections.db                 # Relational SQLite database (15-column schema)
     ├── detections.csv                # Real-time CSV detection log
     ├── plate_crops/                  # Highest-resolution enhanced license plate snapshots
-    └── plate_snapshots/              # Full vehicle context evidence cards with zoomed insets
+    └── snapshots/                    # Full vehicle context evidence cards with zoomed insets
 ```
 
 ---
@@ -200,7 +226,7 @@ traffic-automation/
 
 ### 5.1. System Requirements
 - **Operating System**: Windows 10/11, Ubuntu 20.04+, or macOS
-- **Python**: Version 3.10 to 3.13
+- **Python**: Version 3.10 or higher
 - **Hardware**:
   - *CPU*: Intel Core i5/i7/i9 or AMD Ryzen (runs smoothly with frame decimation)
   - *GPU* (Optional): NVIDIA GPU with CUDA 11.8 / 12.1 for accelerated inference
@@ -216,34 +242,33 @@ cd traffic-automation
 #### Step 2: Create a Virtual Environment
 ```powershell
 # Using Python venv
-python -m venv venv
-.\venv\Scripts\Activate.ps1
+python -m venv .venv
 
-# Or using Conda
-conda create -n traffic python=3.11 -y
-conda activate traffic
+# On Windows (PowerShell):
+.\.venv\Scripts\Activate.ps1
+
+# On Windows (Command Prompt):
+.\.venv\Scripts\activate.bat
+
+# On Linux / macOS:
+source .venv/bin/activate
 ```
 
-#### Step 3: Install PyTorch
-- **For CPU Only**:
-  ```bash
-  pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-  ```
-- **For NVIDIA GPU (CUDA 12.1)**:
-  ```bash
-  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-  ```
-
-#### Step 4: Install Dependencies
+#### Step 3: Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-#### Step 5: Verify Model Weights
-Ensure the following model weight files are present in the `models/` directory:
-- `models/plate_detector.pt` (Trained YOLO license plate detector)
-- `models/EasyOCR/models/bn_license_tps.pth` (Bengali OCR weights)
-- `yolov8n.pt` (Base vehicle detection weights — automatically downloaded on first run)
+#### Step 4: Optional OpenAI Package
+For multimodal GPT-4o Vision reasoning on degraded plates:
+```bash
+pip install openai
+```
+
+#### Step 5: Verify Model Weights & OCR
+- `yolov8n.pt`: Base vehicle detector (auto-downloaded on first run if absent).
+- `models/plate_detector.pt`: Specialized Bangladeshi plate detection weights.
+- `EasyOCR`: On initial run, EasyOCR downloads base models into `~/.EasyOCR/model/` (`bengali.pth`, `craft_mlt_25k.pth`). If custom weights in `models/EasyOCR/models/` are provided, the system loads the specialized `bn_license_tps` network.
 
 ---
 
@@ -251,15 +276,25 @@ Ensure the following model weight files are present in the `models/` directory:
 
 | Section | Parameter | Default | Description |
 |---|---|---|---|
-| **input** | `source` | `cctv_footage.mp4` | Path to video file, webcam index (`0`), or RTSP stream |
-| | `frame_decimation` | `5` | Process 1 out of every N frames (e.g., 60 FPS $\rightarrow$ 12 FPS) |
-| **speed** | `speed_limit_kmh` | `60.0` | Base roadway speed limit |
+| **input** | `source` | `cctv_footage.mp4` | Video file, webcam index (`0`), or RTSP stream |
+| | `frame_decimation` | `"auto"` | Automatic decimation targeting `target_process_fps` |
+| | `target_process_fps` | `15` | Effective processing rate for ByteTrack stability |
+| **vehicle_detection** | `confidence_threshold` | `0.35` | Minimum YOLO confidence for vehicle detection |
+| | `target_classes` | `[2, 3, 5, 7]` | COCO classes: car (2), motorcycle (3), bus (5), truck (7) |
+| **speed** | `reference_resolution` | `[2046, 1080]` | Resolution against which `source_polygon` was defined |
+| | `speed_limit_kmh` | `60.0` | Base roadway speed limit |
 | | `speed_tolerance_kmh` | `5.0` | Grace tolerance buffer before triggering violation (65 km/h) |
 | | `min_measurement_y` | `260` | Horizon cutoff line; ignores pixel jitter above this $y$-coordinate |
 | | `min_track_frames` | `8` | Minimum frames a track must be observed before evaluating speed |
 | | `min_sustained_frames` | `6` | Minimum sustained readings above limit to confirm speeding |
 | | `ground_width_meters` | `8.0` | Physical roadway width in meters (2 lanes) |
 | | `ground_length_meters` | `30.0` | Physical length of visible road stretch between IPM points |
+| **lane_zone** | `reference_resolution` | `[2046, 1080]` | Resolution against which lane points were calibrated |
+| | `points` | `[[280,950],...]` | 4 quadrilateral points ($P_1..P_4$) defining directional lane |
+| **traffic_light** | `reference_resolution` | `[1280, 720]` | Reference resolution for signal box and stop line |
+| | `strip_half_width` | `34` | Pixel half-width of dilated stop-strip zone |
+| | `light_box_points` | `[[764,41],...]` | Polygon ROI covering traffic signal head |
+| | `signal_line_points`| `[[1150,390],...]`| Pixel endpoints of road stop line |
 | **alerts** | `beep_enabled` | `true` | Enable non-blocking audio beep on violation |
 | | `beep_frequency_hz` | `1200` | Beep pitch frequency |
 | | `beep_duration_ms` | `250` | Beep duration in milliseconds |
@@ -273,98 +308,120 @@ Ensure the following model weight files are present in the `models/` directory:
 
 ## 🚀 7. Execution & CLI Usage Reference
 
-### 7.1. Mode 1: Primary ALPR & Speed Monitoring (Default)
-Runs vehicle detection, tracking, license plate localization, Bengali OCR, speed enforcement, audio beeps, and exports the master Excel workbook.
+### 7.1. Master CLI Orchestrator (`main.py`)
+
+[main.py](file:///d:/traffic-automation/main.py) is the master entry point with full CLI override support:
 
 ```bash
-# Run with live preview window
-python main.py
+# 1. Master Unified Pipeline (Speed + Lane + ALPR + Auto-Excel)
+python main.py --mode all
 
-# Run on a custom video footage
-python main.py path/to/surveillance_video.mp4
+# 2. Custom Video & Headless Server Mode
+python main.py path/to/video.mp4 --mode all --no-display
 
-# Run in headless mode (no GUI window)
-python main.py --no-display
+# 3. Dedicated Wrong-Lane / Wrong-Way Mode
+python main.py cctv_footage.mp4 --mode lane
 
-# Test only the first 500 frames
-python main.py --max-frames 500 --no-display
+# 4. Dedicated IPM Speed Violation Mode
+python main.py cctv_footage.mp4 --mode speed
+
+# 5. Dedicated Plate Capture & ALPR Mode
+python main.py cctv_footage.mp4 --mode plate
+
+# 6. Dedicated Traffic Light Stop-Strip Mode
+python main.py light_cut.mp4 --mode traffic_light
+
+# 7. Excel Report Generation (Offline Local EasyOCR)
+python main.py --mode excel --no-gpt
+
+# 8. Excel Report Generation (OpenAI GPT-4o Vision)
+python main.py --mode excel
 ```
 
-### 7.2. Mode 2: Lane Discipline & Wrong-Way Enforcement
-Enforces lane boundaries, forbidden lane transitions, and wrong-way travel.
+### 7.2. Standalone Subtask Scripts
+
+Every subtask can also be executed directly:
 
 ```bash
-python main.py --mode lane
-```
+# Dedicated Lane Discipline Pipeline
+python wrong_lane_violation.py cctv_footage.mp4
 
-### 7.3. Mode 3: Traffic Light & Stop-Strip Violation
-Detects vehicles crossing the stop-strip during a red light.
+# Dedicated Speed Violation Pipeline
+python speed_violation.py cctv_footage.mp4
 
-```bash
-python main.py --mode traffic_light
-```
+# Dedicated License Plate Capture Pipeline
+python license_plate_capture.py cctv_footage.mp4
 
-### 7.4. Mode 4: Offline High-Accuracy AI Post-Processing & Excel Export
-Processes harvested clear plate snapshots (`outputs/plate_crops/`) using deep OCR or OpenAI GPT-4o Vision and generates the executive Excel report.
+# Dedicated Traffic Light Violation Pipeline
+python traffic_light_violation.py light_cut.mp4
 
-```bash
-# 1. Run local neural OCR post-processing & Excel generation
-python process_crops.py
+# Standalone Excel Exporter (Offline)
+python export_excel.py --no-gpt
 
-# 2. Run with OpenAI GPT-4o Vision (passing API key via CLI)
-python process_crops.py --gpt --api-key "sk-..."
-
-# 3. Run with OpenAI GPT-4o Vision (using environment variable)
-set OPENAI_API_KEY="sk-..."       # Windows CMD
-$env:OPENAI_API_KEY="sk-..."     # Windows PowerShell
-export OPENAI_API_KEY="sk-..."   # Linux / macOS
-python process_crops.py --gpt
+# Offline OCR Post-Processing Engine
+python process_crops.py --no-gpt
 ```
 
 ---
 
 ## 📊 8. Database & Data Output Schema
 
-### 8.1. SQLite Database Schema (`outputs/detections.db`)
+### 8.1. Relational SQLite Database Schema (`outputs/detections.db`)
+All pipelines write to the standardized 15-column `detections` table:
+
 ```sql
 CREATE TABLE IF NOT EXISTS detections (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp_sec REAL,
-    pc_date TEXT,               -- Host PC Date (YYYY-MM-DD)
-    pc_time TEXT,               -- Host PC Time (HH:MM:SS)
-    track_id INTEGER,
-    plate_bn TEXT,              -- Bengali License Plate Text
-    plate_en TEXT,              -- English Transliterated Plate Text
-    confidence REAL,            -- OCR Confidence Score (0.0 - 1.0)
-    speed_kmh REAL,             -- Calibrated Travel Speed
-    peak_speed_kmh REAL,        -- Peak Velocity
-    is_speeding INTEGER,        -- 1 if speeding, 0 if compliant
-    plate_crop_path TEXT,       -- Path to clearest enhanced plate crop
-    snapshot_path TEXT          -- Path to vehicle context evidence card
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    pc_date          TEXT,     -- Host PC Date (YYYY-MM-DD)
+    pc_time          TEXT,     -- Host PC Clock Time (HH:MM:SS)
+    timestamp_sec    REAL,     -- Video presentation timestamp (seconds)
+    frame_idx        INTEGER,  -- Video frame index
+    track_id         INTEGER,  -- ByteTrack persistent vehicle identifier
+    plate_bn         TEXT,     -- BRTA Bengali License Plate String
+    plate_en         TEXT,     -- Standardized English Transliteration
+    plate_conf       REAL,     -- OCR Character Confidence Score (0.0 to 1.0)
+    speed_kmh        REAL,     -- Calibrated Vehicle Speed (km/h)
+    peak_speed_kmh   REAL,     -- Maximum Speed in Measurement Zone (km/h)
+    speeding         INTEGER,  -- Boolean (1 = Speeding Violation, 0 = Normal)
+    lane_violation   TEXT,     -- Lane Violation Reason ("opposite_direction", etc.)
+    violation_type   TEXT,     -- Violation Label ("SPEED", "WRONG-WAY", "RED-LIGHT")
+    plate_crop_path  TEXT,     -- File Path to Enhanced Plate Crop
+    snapshot_path    TEXT      -- File Path to Full Evidence Snapshot Card
 );
 ```
 
 ### 8.2. CSV Detection Log Schema (`outputs/detections.csv`)
-`timestamp_sec, pc_date, pc_time, track_id, plate_bn, plate_en, confidence, speed_kmh, peak_speed_kmh, is_speeding, bbox, snapshot_path`
+Append-mode CSV log with headers:
+```text
+pc_date, pc_time, timestamp_sec, frame_idx, track_id, plate_bn, plate_en, plate_conf, speed_kmh, peak_speed_kmh, speeding, lane_violation, violation_type, plate_crop_path, snapshot_path
+```
 
 ---
 
-## ❓ 9. Troubleshooting & Common Questions
+## ❓ 9. Troubleshooting & Developer FAQ
 
 #### Q1: "Permission denied: outputs\traffic_violations_alpr.xlsx"
-- **Cause**: The Excel file is open in Microsoft Excel on Windows, which locks the file against write access.
-- **Resolution**: The system automatically detects this and saves the report to a fallback timestamped file (e.g., `outputs/traffic_violations_alpr_YYYYMMDD_HHMMSS.xlsx`). Close the file in Excel if you wish to overwrite the default filename.
+- **Cause**: The Excel file is open in Microsoft Excel on Windows, locking write access.
+- **Resolution**: The system automatically detects this and writes to a timestamped file (`outputs/traffic_violations_alpr_YYYYMMDD_HHMMSS.xlsx`). Close Excel if you wish to overwrite the default filename.
 
-#### Q2: Vehicles driving at normal speed are flagged as speeding
-- **Cause**: Ground homography dimensions or horizon perspective compression.
-- **Resolution**: Adjust `config.yaml`:
-  - Increase `ground_length_meters` if distances are underestimated.
-  - Ensure `min_measurement_y: 260` to ignore perspective jitter near the horizon.
-  - Adjust `speed_tolerance_kmh: 5.0` to set a suitable grace buffer.
+#### Q2: Video playback is freezing or stuttering (laggy FPS).
+- **Cause**: CCTV feeds at 60 FPS without frame decimation saturate CPU/GPU resources.
+- **Resolution**: Use `input.frame_decimation: "auto"` (or pass `--decimation 4`), and run headless via `--no-display` when deploying to production servers.
 
-#### Q3: "Using CPU. Note: This module is much faster with a GPU."
+#### Q3: Bengali text appears as question marks or squares on Windows.
+- **Cause**: Windows CMD/PowerShell default codepage is not UTF-8.
+- **Resolution**: Run `chcp 65001` before launching the script. The codebase already configures `sys.stdout.reconfigure(encoding='utf-8')` to prevent encoding crashes.
+
+#### Q4: Vehicles driving at normal speed are flagged as speeding.
+- **Cause**: Perspective distortion or homography stretch mismatch.
+- **Resolution**: In [config.yaml](file:///d:/traffic-automation/config.yaml):
+  - Ensure `min_measurement_y: 260` is set to ignore perspective compression near the horizon.
+  - Adjust `speed_tolerance_kmh: 5.0` to configure the grace buffer.
+  - Recalibrate `ground_length_meters` to match the exact measured distance between `source_polygon` points.
+
+#### Q5: "Using CPU. Note: This module is much faster with a GPU."
 - **Cause**: PyTorch is using the CPU.
-- **Resolution**: The system runs stably on CPU due to frame decimation (`frame_decimation: 5`). For GPU acceleration, install the CUDA-enabled PyTorch build:
+- **Resolution**: The system runs reliably on CPU thanks to smart frame decimation. For GPU acceleration:
   ```bash
   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
   ```
