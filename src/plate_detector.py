@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
@@ -407,6 +410,9 @@ class BanglaPlateOCR:
             return "", "", 0.0
 
         variations = PlatePreprocessor.enhance_for_ocr(plate_crop)
+        # Prioritize sharp_clahe first as it provides superior Bengali numeral contrast on green plates
+        variations.sort(key=lambda x: 0 if x[0] == "sharp_clahe" else 1)
+
         best_bn = ""
         best_en = ""
         best_conf = 0.0
@@ -417,9 +423,7 @@ class BanglaPlateOCR:
             # Dual-line direct box segmentation (Bangladeshi standard 2-line layout)
             line1_box = [0, vw, 0, int(vh * 0.54)]
             line2_box = [0, vw, int(vh * 0.42), vh]
-            full_box = [0, vw, 0, vh]
-
-            h_list = [line1_box, line2_box, full_box]
+            h_list = [line1_box, line2_box]
 
             try:
                 rec_res = self._bn_reader.recognize(var_img, horizontal_list=h_list, free_list=[])
@@ -429,13 +433,16 @@ class BanglaPlateOCR:
                 line2_text = rec_res[1][1].strip() if len(rec_res) > 1 else ""
                 line2_conf = float(rec_res[1][2]) if len(rec_res) > 1 else 0.0
 
-                full_text = rec_res[2][1].strip() if len(rec_res) > 2 else ""
-                full_conf = float(rec_res[2][2]) if len(rec_res) > 2 else 0.0
-
-                # If full text has strong digits and line 2 was empty, use full text as line 2
-                if not line2_text and any(c in BN_DIGITS or c in EN_DIGITS for c in full_text):
-                    line2_text = full_text
-                    line2_conf = max(line2_conf, full_conf)
+                # If both lines failed to detect digits, test full-box fallback
+                if not line1_text and not line2_text:
+                    full_res = self._bn_reader.recognize(
+                        var_img, horizontal_list=[[0, vw, 0, vh]], free_list=[]
+                    )
+                    full_text = full_res[0][1].strip() if len(full_res) > 0 else ""
+                    full_conf = float(full_res[0][2]) if len(full_res) > 0 else 0.0
+                    if any(c in BN_DIGITS or c in EN_DIGITS for c in full_text):
+                        line2_text = full_text
+                        line2_conf = full_conf
 
                 bn_text, en_text, syntax_score = self.parse_bangla_plate(line1_text, line2_text)
                 combined_conf = (max(line1_conf, 0.1) * 0.3 + max(line2_conf, 0.1) * 0.7) * syntax_score
@@ -445,8 +452,8 @@ class BanglaPlateOCR:
                     best_en = en_text
                     best_conf = combined_conf
 
-                # Fast exit: if first variation produced a confident read, avoid redundant OCR
-                if best_conf >= 0.40:
+                # Fast exit: if confident reading obtained, skip redundant variations
+                if best_conf >= 0.30:
                     break
 
             except Exception as e:
@@ -456,7 +463,10 @@ class BanglaPlateOCR:
 
 
 class TrackPlateManager:
-    """Manages multi-frame temporal voting and plate accumulation per vehicle track."""
+    """
+    Manages multi-frame temporal voting, plate accumulation, and non-blocking asynchronous
+    OCR recognition per vehicle track. Prevents GUI/video freezing on CPU architectures.
+    """
 
     @dataclass
     class TrackRecord:
@@ -481,12 +491,64 @@ class TrackPlateManager:
         plate_ocr: BanglaPlateOCR,
         ocr_interval_frames: int = 3,
         min_ocr_conf: float = 0.18,
+        async_ocr: bool = True,
     ) -> None:
         self.detector = plate_detector
         self.ocr = plate_ocr
         self.ocr_interval_frames = max(1, int(ocr_interval_frames))
         self.min_ocr_conf = min_ocr_conf
         self.records: Dict[int, TrackPlateManager.TrackRecord] = {}
+        self._lock = threading.Lock()
+        self.async_ocr = async_ocr
+
+        if self.async_ocr:
+            self._ocr_queue: queue.Queue = queue.Queue(maxsize=32)
+            self._stop_event = threading.Event()
+            self._worker_thread = threading.Thread(
+                target=self._ocr_worker, daemon=True, name="PlateOCRWorker"
+            )
+            self._worker_thread.start()
+        else:
+            self._ocr_queue = None
+            self._stop_event = None
+            self._worker_thread = None
+
+    def _ocr_worker(self) -> None:
+        """Background worker thread consuming plate crops for non-blocking neural OCR."""
+        while not self._stop_event.is_set():
+            try:
+                task = self._ocr_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+
+            if task is None:
+                self._ocr_queue.task_done()
+                break
+
+            track_id, plate_crop, frame_idx = task
+            try:
+                bn_text, en_text, conf = self.ocr.recognize(plate_crop)
+                with self._lock:
+                    if track_id in self.records:
+                        record = self.records[track_id]
+                        record.readings_count += 1
+
+                        is_better_text = False
+                        if conf > record.best_ocr_conf and conf >= self.min_ocr_conf:
+                            is_better_text = True
+                        elif bn_text and not record.best_plate_text:
+                            is_better_text = True
+                        elif ("-" in bn_text) and ("-" not in record.best_plate_text):
+                            is_better_text = True
+
+                        if is_better_text:
+                            record.best_plate_text = bn_text
+                            record.best_plate_text_en = en_text
+                            record.best_ocr_conf = max(conf, record.best_ocr_conf)
+            except Exception as e:
+                logger.debug("[TrackPlateManager] Async OCR error on track %d: %s", track_id, e)
+            finally:
+                self._ocr_queue.task_done()
 
     def update_track(
         self,
@@ -499,13 +561,13 @@ class TrackPlateManager:
     ) -> Optional[PlateDetectionResult]:
         """
         Updates plate reading for a vehicle track.
-        Continuously optimizes for maximum plate resolution, sharpness, and readability.
+        Executes fast YOLO plate localization on-thread and dispatches heavy OCR asynchronously.
         """
-        if track_id not in self.records:
-            self.records[track_id] = self.TrackRecord(track_id=track_id)
-
-        record = self.records[track_id]
-        record.last_speed_kmh = speed_kmh
+        with self._lock:
+            if track_id not in self.records:
+                self.records[track_id] = self.TrackRecord(track_id=track_id)
+            record = self.records[track_id]
+            record.last_speed_kmh = speed_kmh
 
         h, w = frame.shape[:2]
         vx1, vy1, vx2, vy2 = vehicle_bbox
@@ -515,7 +577,7 @@ class TrackPlateManager:
         if vw < 55 or vh < 55 or vy2 < 240:
             return None
 
-        # Determine if we should run detection on this frame
+        # Determine if we should run YOLO plate detection on this frame
         should_run = (
             (record.best_plate_crop is None)
             or (frame_idx % self.ocr_interval_frames == 0)
@@ -545,14 +607,6 @@ class TrackPlateManager:
             current_area = cw * ch
             sharpness = PlatePreprocessor.compute_plate_sharpness(plate_crop)
 
-            # Recognize plate with custom OCR
-            bn_text, en_text, conf = self.ocr.recognize(plate_crop)
-            det.plate_text = bn_text
-            det.plate_text_en = en_text
-            det.ocr_confidence = conf
-
-            record.readings_count += 1
-
             # Quality metrics: composite score of resolution and edge sharpness
             current_quality = current_area * np.sqrt(max(1.0, sharpness))
             prev_quality = record.best_plate_area * np.sqrt(max(1.0, record.best_plate_sharpness))
@@ -565,41 +619,76 @@ class TrackPlateManager:
             )
 
             if is_better_crop:
-                record.best_plate_crop = plate_crop.copy()
-                record.best_plate_crop_enhanced = PlatePreprocessor.enhance_for_display(plate_crop)
-                record.best_plate_sharpness = sharpness
-                record.best_plate_area = current_area
-                record.best_vehicle_snapshot = vehicle_crop.copy()
-                record.frame_idx = frame_idx
-                record.timestamp_sec = timestamp_sec
+                with self._lock:
+                    record.best_plate_crop = plate_crop.copy()
+                    record.best_plate_crop_enhanced = PlatePreprocessor.enhance_for_display(plate_crop)
+                    record.best_plate_sharpness = sharpness
+                    record.best_plate_area = current_area
+                    record.best_vehicle_snapshot = vehicle_crop.copy()
+                    record.frame_idx = frame_idx
+                    record.timestamp_sec = timestamp_sec
 
-            # Upgrade text reading if confident
-            is_better_text = False
-            if conf > record.best_ocr_conf and conf >= self.min_ocr_conf:
-                is_better_text = True
-            elif bn_text and not record.best_plate_text:
-                is_better_text = True
-            elif ("-" in bn_text) and ("-" not in record.best_plate_text):
-                is_better_text = True
+                # Enqueue for OCR only if crop is large enough to decipher (>= 400 px² and >= 30x12)
+                if current_area >= 400 and cw >= 30 and ch >= 12:
+                    if self.async_ocr and self._ocr_queue is not None:
+                        try:
+                            self._ocr_queue.put_nowait((track_id, plate_crop.copy(), frame_idx))
+                        except queue.Full:
+                            pass
+                    else:
+                        bn_text, en_text, conf = self.ocr.recognize(plate_crop)
+                        with self._lock:
+                            record.readings_count += 1
+                            if conf > record.best_ocr_conf and conf >= self.min_ocr_conf:
+                                record.best_plate_text = bn_text
+                                record.best_plate_text_en = en_text
+                                record.best_ocr_conf = max(conf, record.best_ocr_conf)
+                            elif bn_text and not record.best_plate_text:
+                                record.best_plate_text = bn_text
+                                record.best_plate_text_en = en_text
+                                record.best_ocr_conf = max(conf, record.best_ocr_conf)
 
-            if is_better_text:
-                record.best_plate_text = bn_text
-                record.best_plate_text_en = en_text
-                record.best_ocr_conf = max(conf, record.best_ocr_conf)
+            with self._lock:
+                det.plate_text = record.best_plate_text
+                det.plate_text_en = record.best_plate_text_en
+                det.ocr_confidence = record.best_ocr_conf
 
             best_det = det
 
         return best_det
 
+    def flush(self, timeout: float = 3.0) -> None:
+        """Waits for pending OCR tasks to finish processing."""
+        if self._ocr_queue is not None:
+            end_t = time.time() + timeout
+            while not self._ocr_queue.empty() and time.time() < end_t:
+                time.sleep(0.05)
+
+    def shutdown(self, wait_seconds: float = 2.0) -> None:
+        """Stops the asynchronous OCR background worker gracefully."""
+        if self.async_ocr and self._worker_thread is not None:
+            self.flush(timeout=wait_seconds)
+            if self._stop_event is not None:
+                self._stop_event.set()
+            try:
+                if self._ocr_queue is not None:
+                    self._ocr_queue.put_nowait(None)
+            except Exception:
+                pass
+            self._worker_thread.join(timeout=1.0)
+
     def get_clearest_plate_crop(self, track_id: int) -> Optional[np.ndarray]:
         """Returns the sharpest, highest-clarity enhanced plate snapshot available for track."""
-        record = self.records.get(track_id)
-        if not record:
-            return None
-        return record.best_plate_crop_enhanced if record.best_plate_crop_enhanced is not None else record.best_plate_crop
+        with self._lock:
+            record = self.records.get(track_id)
+            if not record:
+                return None
+            return record.best_plate_crop_enhanced if record.best_plate_crop_enhanced is not None else record.best_plate_crop
 
     def get_record(self, track_id: int) -> Optional[TrackPlateManager.TrackRecord]:
-        return self.records.get(track_id)
+        with self._lock:
+            return self.records.get(track_id)
 
     def remove_track(self, track_id: int) -> Optional[TrackPlateManager.TrackRecord]:
-        return self.records.pop(track_id, None)
+        with self._lock:
+            return self.records.pop(track_id, None)

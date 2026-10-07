@@ -70,8 +70,75 @@ class PerspectiveSpeedEstimator:
         self.window_duration_sec = float(window_duration_sec)
 
         self._homography_matrix = None
+        self.source_polygon = [list(p) for p in source_polygon]
         self._init_homography(source_polygon)
         self._tracks: Dict[int, TrackSpeedHistory] = {}
+
+    @classmethod
+    def from_config(
+        cls,
+        cfg: dict,
+        frame_size: Optional[Tuple[int, int]] = None,
+    ) -> "PerspectiveSpeedEstimator":
+        """
+        Creates and calibrates a PerspectiveSpeedEstimator from configuration.
+        Auto-scales the source polygon and horizon threshold if reference_resolution is set
+        and differs from the actual video frame resolution.
+        """
+        speed_cfg = cfg.get("speed", {})
+        source_poly = list(
+            speed_cfg.get(
+                "source_polygon",
+                [[750, 180], [1350, 180], [1850, 980], [450, 980]],
+            )
+        )
+        # Deep copy points
+        source_poly = [[float(p[0]), float(p[1])] for p in source_poly]
+
+        ref_res = speed_cfg.get("reference_resolution")
+        if ref_res is None:
+            ref_res = cfg.get("lane_zone", {}).get("reference_resolution")
+
+        min_meas_y = float(speed_cfg.get("min_measurement_y", 260.0))
+
+        if frame_size is not None and ref_res is not None:
+            frame_w, frame_h = frame_size
+            ref_w, ref_h = int(ref_res[0]), int(ref_res[1])
+            if ref_w > 0 and ref_h > 0 and (ref_w != frame_w or ref_h != frame_h):
+                sx = frame_w / float(ref_w)
+                sy = frame_h / float(ref_h)
+                source_poly = [
+                    [float(p[0] * sx), float(p[1] * sy)]
+                    for p in source_poly
+                ]
+                min_meas_y = min_meas_y * sy
+                logger.info(
+                    "[SpeedEstimator] Auto-scaled speed polygon to frame resolution (%dx%d) using scale (%.3f, %.3f)",
+                    frame_w,
+                    frame_h,
+                    sx,
+                    sy,
+                )
+
+        ground_w = float(speed_cfg.get("ground_width_meters", 8.0))
+        ground_l = float(speed_cfg.get("ground_length_meters", 30.0))
+        speed_limit = float(speed_cfg.get("speed_limit_kmh", 60.0))
+        speed_tol = float(speed_cfg.get("speed_tolerance_kmh", 5.0))
+        min_track = int(speed_cfg.get("min_track_frames", 8))
+        min_sustained = int(speed_cfg.get("min_sustained_frames", 6))
+        window_sec = float(speed_cfg.get("window_duration_sec", 0.5))
+
+        return cls(
+            source_polygon=source_poly,
+            ground_width_meters=ground_w,
+            ground_length_meters=ground_l,
+            speed_limit_kmh=speed_limit,
+            speed_tolerance_kmh=speed_tol,
+            min_track_frames=min_track,
+            min_sustained_frames=min_sustained,
+            min_measurement_y=min_meas_y,
+            window_duration_sec=window_sec,
+        )
 
     def _init_homography(self, source_polygon: Sequence[Sequence[float]]) -> None:
         if len(source_polygon) != 4:

@@ -13,7 +13,7 @@ paths:
 input:
   source: "cctv_footage.mp4"
   frame_decimation: "auto"
-  target_process_fps: 12
+  target_process_fps: 15
   force_fps: 0
 
 vehicle_detection:
@@ -30,6 +30,7 @@ bytetrack:
 
 # Speed estimation (Perspective Homography IPM calibration)
 speed:
+  reference_resolution: [2046, 1080]
   method: "homography"   # "homography" (calibrated metric ground plane) or "pixel_ratio"
   speed_limit_kmh: 60.0
   speed_tolerance_kmh: 5.0      # Grace buffer to prevent false alarms near limit (60+5=65 km/h)
@@ -45,6 +46,21 @@ speed:
     - [450, 980]    # bottom-left
   ground_width_meters: 8.0      # 2-lane roadway width (~3.6-4.0m per lane)
   ground_length_meters: 30.0    # visible road stretch from y=180 to y=980 (30m)
+
+# Traffic Light Violation Monitoring
+traffic_light:
+  reference_resolution: [1280, 720]
+  strip_half_width: 34
+  light_box_points:
+    - [764, 41]
+    - [780, 41]
+    - [780, 65]
+    - [820, 63]
+    - [820, 86]
+    - [764, 93]
+  signal_line_points:
+    - [1150, 390]
+    - [540, 700]
 
 # Sound & Visual Alerts
 alerts:
@@ -71,12 +87,21 @@ lane_zone:
   # Yellow lane guide polygon points (P1, P2, P3, P4)
   # Points were defined on a 960x540 reference view and are auto-scaled
   # to the actual source frame resolution.
-  reference_resolution: [2560, 1440]
+  # traffic_light_wrong_lane
+  # reference_resolution: [2560, 1440]
+  # points:
+  #   - [300, 1000]
+  #   - [1300, 1260]
+  #   - [2000, 500]
+  #   - [1600, 400]
+  # cctv_footage.mp4
+  reference_resolution: [2046, 1080]
   points:
-    - [300, 1000]
-    - [1300, 1260]
-    - [2000, 500]
-    - [1600, 400]
+    - [280, 950]
+    - [2000, 950]
+    - [1500, 150]
+    - [750, 150]
+
 
 motion:
   history_size: 20

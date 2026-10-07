@@ -89,7 +89,7 @@ def export_to_excel(
     # ---------------------------------------------------------
     # Row 1: Executive Title Banner
     # ---------------------------------------------------------
-    ws.merge_cells("A1:Q1")
+    ws.merge_cells("A1:R1")
     t_cell = ws["A1"]
     t_cell.value = "BANGLADESH HIGHWAY TRAFFIC SURVEILLANCE & ALPR AUDIT REPORT"
     t_cell.font = Font(name=font_family, size=15, bold=True, color="FFFFFF")
@@ -105,7 +105,9 @@ def export_to_excel(
         r.get("speeding", 0) == 1 
         or float(r.get("speed_kmh", 0)) > (speed_limit_kmh + speed_tolerance_kmh)
         or float(r.get("peak_speed_kmh", 0)) > (speed_limit_kmh + speed_tolerance_kmh)
-        or "VIOLATION" in str(r.get("reason", "")).upper()
+        or any(k in str(r.get("violation_type", "")).upper() for k in ["VIOLATION", "WRONG", "ENTRY", "RED", "SPEED"])
+        or any(k in str(r.get("lane_violation", "")).upper() for k in ["OPPOSITE", "ENTRY", "WRONG"])
+        or any(k in str(r.get("reason", "")).upper() for k in ["OPPOSITE", "ENTRY", "WRONG", "RED", "SPEED", "VIOLATION"])
     ))
     total_normal = total_records - total_violators
     compliance_rate = (total_normal / max(1, total_records)) * 100
@@ -128,7 +130,7 @@ def export_to_excel(
 
     # Card 2: Violations
     ws.merge_cells("E2:G2")
-    ws["E2"] = "SPEED VIOLATIONS"
+    ws["E2"] = "TOTAL VIOLATIONS"
     ws["E2"].font = Font(name=font_family, size=9, bold=True, color="B91C1C")
     ws["E2"].fill = kpi_viol_fill
     ws["E2"].alignment = Alignment(horizontal="center", vertical="center")
@@ -153,13 +155,13 @@ def export_to_excel(
     ws["I3"].alignment = Alignment(horizontal="center", vertical="center")
 
     # Card 4: Parameters
-    ws.merge_cells("M2:Q2")
+    ws.merge_cells("M2:R2")
     ws["M2"] = "ENFORCEMENT PARAMETERS & CLOCK"
     ws["M2"].font = Font(name=font_family, size=9, bold=True, color="475569")
     ws["M2"].fill = kpi_card_fill
     ws["M2"].alignment = Alignment(horizontal="center", vertical="center")
 
-    ws.merge_cells("M3:Q3")
+    ws.merge_cells("M3:R3")
     ws["M3"] = f"Speed Limit: {speed_limit_kmh:.0f} km/h (+{speed_tolerance_kmh:.0f} buffer) | PC Clock: {generated_pc_time}"
     ws["M3"].font = Font(name=font_family, size=9, bold=True, color="334155")
     ws["M3"].fill = kpi_card_fill
@@ -237,17 +239,36 @@ def export_to_excel(
 
         excess_speed = max(0.0, eff_speed - speed_limit_kmh) if is_speeding else 0.0
 
-        if is_speeding:
+        lane_viol = str(item.get("lane_violation", "") or item.get("reason", "") or "").lower()
+        v_type_str = str(item.get("violation_type", "") or "").lower()
+        has_wrong_lane = (
+            "opposite" in lane_viol
+            or "wrong" in lane_viol
+            or "entry" in lane_viol
+            or "opposite" in v_type_str
+            or "wrong" in v_type_str
+            or "lane" in v_type_str
+        )
+        has_red_light = "red" in v_type_str or "red" in lane_viol
+
+        if is_speeding and has_wrong_lane:
+            viol_type = "Speed + Wrong-Way Violation"
+            status_text = "🚨 SPEED + WRONG-WAY"
+        elif is_speeding:
             viol_type = "Speed Violation"
             status_text = "🚨 SPEEDING"
-        elif "opposite" in v_type_raw or "wrong" in v_type_raw:
-            viol_type = "Wrong-Way / Lane"
-            status_text = "🚨 WRONG-WAY"
-        elif "red" in v_type_raw:
+        elif has_wrong_lane:
+            if "entry" in lane_viol or "entry" in v_type_str:
+                viol_type = "Forbidden Entry Violation"
+                status_text = "🚨 ENTRY-VIOL"
+            else:
+                viol_type = "Wrong-Way Violation"
+                status_text = "🚨 WRONG-WAY"
+        elif has_red_light:
             viol_type = "Red Light Violation"
             status_text = "🚨 RED LIGHT"
         else:
-            viol_type = "None (Compliant)"
+            viol_type = "Compliant"
             status_text = "✅ NORMAL"
 
         plate_bn = item.get("plate_bn", "")
@@ -297,7 +318,8 @@ def export_to_excel(
         # Allocate comfortable height for visual thumbnails
         ws.row_dimensions[row_idx].height = 68
         is_even = (row_idx % 2 == 0)
-        bg = violation_row_fill if is_speeding else (zebra_fill if is_even else None)
+        is_violation = is_speeding or has_wrong_lane or has_red_light
+        bg = violation_row_fill if is_violation else (zebra_fill if is_even else None)
 
         for col_idx, val in enumerate(row_values, start=1):
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
@@ -318,7 +340,7 @@ def export_to_excel(
 
             # Status column badge
             if col_idx == 12:
-                if is_speeding or "VIOLATION" in status_text:
+                if is_violation:
                     cell.fill = violation_status_fill
                     cell.font = violation_status_font
                 else:

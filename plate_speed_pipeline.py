@@ -14,6 +14,7 @@ Detect vehicles (YOLOv8 + ByteTrack)
 
 from __future__ import annotations
 
+import argparse
 import csv
 import datetime
 import logging
@@ -33,6 +34,8 @@ try:
 except ImportError:
     winsound = None
 
+from src.lane_zone import LaneZone
+from src.motion_tracker import MotionTracker
 from src.plate_detector import (
     BanglaPlateOCR,
     LicensePlateDetector,
@@ -50,7 +53,9 @@ from src.utils import (
     resize_for_display,
     resize_to_fit,
     to_english_digits,
+    trigger_beep,
 )
+from src.violation_detector import ViolationDetector, ViolationEvent
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +70,9 @@ class TrackState:
     effective_speed_kmh: float = 0.0
     peak_speed_kmh: float = 0.0
     is_confirmed_speeding: bool = False
+    is_confirmed_lane_violation: bool = False
+    lane_violation_reason: str = ""
+    lane_status: str = "OUT"
     saved: bool = False
     frames_seen: int = 0
     max_vehicle_area: int = 0
@@ -78,8 +86,18 @@ class TrackState:
 # Pipeline Class
 # ---------------------------------------------------------------------------
 class PlateSpeedPipeline:
-    def __init__(self, cfg: dict) -> None:
+    def __init__(self, cfg: dict, enable_lane: bool = True) -> None:
         self.cfg = cfg
+        self.enable_lane = enable_lane
+
+        # Lane Zone & Motion Tracker (Wrong-Way & Lane Violation)
+        self.lane_zone: Optional[LaneZone] = None
+        motion_cfg = cfg.get("motion", {})
+        self.motion_tracker = MotionTracker(
+            history_size=int(motion_cfg.get("history_size", 20)),
+            stale_after_frames=int(motion_cfg.get("stale_after_frames", 90)),
+        )
+        self.violation_detector = ViolationDetector(cfg)
 
         # Speed estimation config
         speed_cfg = cfg.get("speed", {})
@@ -118,6 +136,11 @@ class PlateSpeedPipeline:
         self._beeped_tracks: Set[int] = set()
         self._active_alert_text: str = ""
         self._active_alert_expiry: float = 0.0
+
+        # Persistent sets for exact violation tracking
+        self._confirmed_speed_violators: Set[int] = set()
+        self._confirmed_lane_violators: Set[int] = set()
+        self._violating_tracks: Set[int] = set()
 
         # Plate detection & OCR config
         plate_cfg = cfg.get("plate", {})
@@ -184,36 +207,35 @@ class PlateSpeedPipeline:
             min_ocr_conf=self._plate_min_conf,
         )
 
-    def _trigger_alert_beep(self, track_id: int, speed: float) -> None:
+    def _trigger_alert_beep(self, track_id: int, speed: float = 0.0, violation_type: str = "SPEED") -> None:
         """Plays a non-blocking alert beep sound and displays an on-screen alert banner."""
-        if track_id in self._beeped_tracks:
+        alert_key = f"{track_id}_{violation_type}"
+        if alert_key in self._beeped_tracks:
             return
-        self._beeped_tracks.add(track_id)
+        self._beeped_tracks.add(alert_key)
 
         # Trigger on-screen banner
         now_t = time.time()
-        self._active_alert_text = (
-            f"🚨 ALERT: SPEED VIOLATION! Track #{track_id} clocked at {speed:.1f} km/h (Limit: {self._speed_limit_kmh:.0f})"
-        )
+        if "WRONG" in violation_type or "LANE" in violation_type or "ENTRY" in violation_type or "opposite" in violation_type:
+            lbl = "WRONG-WAY (Opposite Direction)" if "opposite" in violation_type or "WRONG" in violation_type else "FORBIDDEN ENTRY SIDE"
+            self._active_alert_text = f"🚨 ALERT: LANE VIOLATION! Track #{track_id} ({lbl})"
+            logger.warning("🚨 [ALERT] LANE VIOLATION! Track #%d flagged for %s", track_id, lbl)
+        else:
+            self._active_alert_text = (
+                f"🚨 ALERT: SPEED VIOLATION! Track #{track_id} clocked at {speed:.1f} km/h (Limit: {self._speed_limit_kmh:.0f})"
+            )
+            logger.warning(
+                "🚨 [ALERT] SPEED VIOLATION! Track #%d clocked at %.1f km/h (Limit: %.0f km/h + %.0f tolerance)",
+                track_id,
+                speed,
+                self._speed_limit_kmh,
+                self._speed_tolerance_kmh,
+            )
         self._active_alert_expiry = now_t + self._banner_duration_sec
 
-        logger.warning(
-            "🚨 [ALERT] SPEED VIOLATION! Track #%d clocked at %.1f km/h (Limit: %.0f km/h + %.0f tolerance)",
-            track_id,
-            speed,
-            self._speed_limit_kmh,
-            self._speed_tolerance_kmh,
-        )
-
-        # Non-blocking beep on Windows
-        if self._alerts_enabled and winsound is not None:
-            def _play_sound():
-                try:
-                    winsound.Beep(self._beep_freq, self._beep_dur)
-                except Exception:
-                    pass
-
-            threading.Thread(target=_play_sound, daemon=True).start()
+        # Non-blocking debounced audio beep
+        if self._alerts_enabled:
+            trigger_beep(self._beep_freq, self._beep_dur)
 
     def _open_outputs(self, width: int, height: int, fps: float) -> None:
         # CSV
@@ -231,6 +253,8 @@ class PlateSpeedPipeline:
             "speed_kmh",
             "peak_speed_kmh",
             "speeding",
+            "lane_violation",
+            "violation_type",
             "x1",
             "y1",
             "x2",
@@ -259,6 +283,8 @@ class PlateSpeedPipeline:
                 speed_kmh      REAL,
                 peak_speed_kmh REAL,
                 speeding       INTEGER,
+                lane_violation TEXT,
+                violation_type TEXT,
                 plate_crop_path TEXT,
                 snapshot_path  TEXT
             )
@@ -271,6 +297,8 @@ class PlateSpeedPipeline:
             ("pc_time", "TEXT"),
             ("plate_crop_path", "TEXT"),
             ("peak_speed_kmh", "REAL DEFAULT 0.0"),
+            ("lane_violation", "TEXT DEFAULT ''"),
+            ("violation_type", "TEXT DEFAULT 'None'"),
         ]:
             if col not in existing_cols:
                 try:
@@ -312,6 +340,7 @@ class PlateSpeedPipeline:
         peak_speed_kmh: float,
         is_speeding: bool,
         plate_crop: Optional[np.ndarray] = None,
+        lane_violation: str = "",
     ) -> str:
         # Capture current PC system clock time
         now_dt = datetime.datetime.now()
@@ -363,6 +392,9 @@ class PlateSpeedPipeline:
                 info_lines.append(f"TRANSLIT: {plate_en} (conf {plate_conf:.2f})")
             if speed_kmh > 0:
                 info_lines.append(f"SPEED: {speed_kmh:.1f} km/h (Limit: {self._speed_limit_kmh:.0f})")
+            if lane_violation:
+                lbl = "WRONG-WAY (Opposite Direction)" if lane_violation == "opposite_direction" or "wrong" in lane_violation.lower() else f"ENTRY-VIOL ({lane_violation})"
+                info_lines.append(f"*** LANE VIOLATION: {lbl} ***")
             if is_speeding:
                 info_lines.append("*** SPEED LIMIT VIOLATION ***")
 
@@ -375,6 +407,15 @@ class PlateSpeedPipeline:
         snap_name = f"track_{track_id}_frame_{frame_idx}.png"
         snap_path = self._snapshot_dir / snap_name
         cv2.imwrite(str(snap_path), crop)
+
+        if is_speeding and lane_violation:
+            v_type_str = "Speed + Lane Violation"
+        elif is_speeding:
+            v_type_str = "Speed Violation"
+        elif lane_violation:
+            v_type_str = "Wrong-Way / Lane Violation"
+        else:
+            v_type_str = "Compliant"
 
         # CSV logging
         if self._csv_writer and self._csv_file:
@@ -391,6 +432,8 @@ class PlateSpeedPipeline:
                     "speed_kmh": f"{speed_kmh:.1f}",
                     "peak_speed_kmh": f"{peak_speed_kmh:.1f}",
                     "speeding": speeding_val,
+                    "lane_violation": lane_violation,
+                    "violation_type": v_type_str,
                     "x1": x1,
                     "y1": y1,
                     "x2": x2,
@@ -405,8 +448,8 @@ class PlateSpeedPipeline:
         if self._db_conn:
             self._db_conn.execute(
                 """
-                INSERT INTO detections (pc_date, pc_time, timestamp_sec, frame_idx, track_id, plate_bn, plate_en, plate_conf, speed_kmh, peak_speed_kmh, speeding, plate_crop_path, snapshot_path)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO detections (pc_date, pc_time, timestamp_sec, frame_idx, track_id, plate_bn, plate_en, plate_conf, speed_kmh, peak_speed_kmh, speeding, lane_violation, violation_type, plate_crop_path, snapshot_path)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
                 (
                     pc_date,
@@ -420,13 +463,15 @@ class PlateSpeedPipeline:
                     speed_kmh,
                     peak_speed_kmh,
                     speeding_val,
+                    lane_violation,
+                    v_type_str,
                     plate_crop_path,
                     str(snap_path),
                 ),
             )
             self._db_conn.commit()
 
-        tag = "🚨 SPEEDING" if is_speeding else "✅ COMPLIANT"
+        tag = f"🚨 {v_type_str.upper()}" if (is_speeding or lane_violation) else "✅ COMPLIANT"
         logger.info(
             "[Pipeline] %s track=%d plate='%s' (%s) speed=%.1f km/h [PC Time: %s %s] → %s",
             tag,
@@ -436,7 +481,7 @@ class PlateSpeedPipeline:
             speed_kmh,
             pc_date,
             pc_time,
-            snap_path,
+            snap_path.name,
         )
         return str(snap_path)
 
@@ -450,6 +495,8 @@ class PlateSpeedPipeline:
         total_saved: int,
         total_plates: int,
         total_violations: int,
+        speed_violations: int = 0,
+        lane_violations: int = 0,
     ) -> None:
         h, w = frame.shape[:2]
 
@@ -458,17 +505,23 @@ class PlateSpeedPipeline:
         cv2.rectangle(frame, (0, 0), (w, header_h), (16, 24, 32), -1)
 
         pct = f"({(frame_idx / max(1, total_frames)) * 100:.1f}%)" if total_frames > 0 else ""
+        if speed_violations > 0 or lane_violations > 0:
+            viol_detail = f"{total_violations} (Lane:{lane_violations}, Speed:{speed_violations})"
+        else:
+            viol_detail = f"{total_violations}"
+
         hud = (
             f"FPS: {fps:.1f} | Frame: {frame_idx}/{total_frames} {pct} | "
-            f"Active: {active_tracks} | Plates: {total_plates} | Violations: {total_violations} | Logged: {total_saved}"
+            f"Active: {active_tracks} | Plates: {total_plates} | Violations: {viol_detail} | Logged: {total_saved}"
         )
+        hud_color = (0, 80, 255) if total_violations > 0 else (0, 255, 0)
         cv2.putText(
             frame,
             hud,
             (14, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 255, 0),
+            0.62,
+            hud_color,
             2,
             cv2.LINE_AA,
         )
@@ -541,11 +594,21 @@ class PlateSpeedPipeline:
         line_thickness = int(display_cfg.get("line_thickness", 2))
 
         normal_color = tuple(display_cfg.get("bbox_color_normal", [0, 255, 0]))
-        speed_color = tuple(display_cfg.get("bbox_color_violation", [0, 0, 255]))
+        out_of_lane_color = tuple(display_cfg.get("bbox_color_out_of_lane", [255, 180, 0]))
+        violation_color = tuple(display_cfg.get("bbox_color_violation", [0, 0, 255]))
+        lane_color = tuple(display_cfg.get("lane_polygon_color", [0, 255, 255]))
+        draw_lane_points = bool(display_cfg.get("draw_lane_points", True))
 
         with FrameIngester(self.cfg) as ingester:
             fps = ingester.processing_fps
             total_source_frames = int(ingester._capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if self.enable_lane and "lane_zone" in self.cfg:
+                self.lane_zone = LaneZone.from_config(
+                    self.cfg, frame_size=(ingester.frame_width, ingester.frame_height)
+                )
+            self.speed_estimator = PerspectiveSpeedEstimator.from_config(
+                self.cfg, frame_size=(ingester.frame_width, ingester.frame_height)
+            )
             self.vehicle_detector, self.vehicle_tracker = build_detector_and_tracker(self.cfg)
             self._open_outputs(ingester.frame_width, ingester.frame_height, max(1.0, fps))
 
@@ -573,6 +636,15 @@ class PlateSpeedPipeline:
                 detections = self.vehicle_detector.detect(frame)
                 tracked, lost_ids = self.vehicle_tracker.update(detections)
                 annotated = frame.copy()
+
+                # Draw 4-point Lane Zone polygon, guide points P1..P4 and directional arrow
+                if self.lane_zone is not None:
+                    self.lane_zone.draw(
+                        annotated,
+                        polygon_color=lane_color,
+                        thickness=line_thickness,
+                        draw_points=draw_lane_points,
+                    )
 
                 active_ids: Set[int] = set()
                 for vehicle in tracked:
@@ -611,8 +683,52 @@ class PlateSpeedPipeline:
                     is_speeding = self.speed_estimator.is_confirmed_speeding(tid)
                     if is_speeding and not state.is_confirmed_speeding:
                         state.is_confirmed_speeding = True
-                        total_violations += 1
-                        self._trigger_alert_beep(tid, eff_speed)
+                        self._confirmed_speed_violators.add(tid)
+                        self._violating_tracks.add(tid)
+                        self._trigger_alert_beep(tid, eff_speed, violation_type="SPEED")
+
+                    # Lane Anchor, Motion Tracking & Direction Violation
+                    lane_anchor = ((vx1 + vx2) // 2, vy2)
+                    inside_lane = self.lane_zone.contains(lane_anchor) if self.lane_zone is not None else False
+
+                    if self.lane_zone is not None:
+                        self.motion_tracker.update(
+                            track_id=tid,
+                            centroid=lane_anchor,
+                            frame_idx=frame_idx,
+                            inside_lane=inside_lane,
+                        )
+                        if inside_lane:
+                            lane_event = self.violation_detector.evaluate(
+                                track_id=tid,
+                                bbox=bbox,
+                                centroid=lane_anchor,
+                                frame_idx=frame_idx,
+                                lane_zone=self.lane_zone,
+                                motion_tracker=self.motion_tracker,
+                                fps=fps,
+                            )
+                            if lane_event is not None and not state.is_confirmed_lane_violation:
+                                state.is_confirmed_lane_violation = True
+                                state.lane_violation_reason = lane_event.reason
+                                self._confirmed_lane_violators.add(tid)
+                                self._violating_tracks.add(tid)
+                                if lane_event.reason == "opposite_direction":
+                                    r_lbl = "WRONG-WAY"
+                                elif lane_event.reason == "forbidden_entry_side":
+                                    r_lbl = "ENTRY-VIOL"
+                                elif lane_event.reason == "speeding":
+                                    r_lbl = "SPEED"
+                                else:
+                                    r_lbl = "VIOLATION"
+                                self._trigger_alert_beep(tid, eff_speed, violation_type=r_lbl)
+
+                        existing_lane_event = self.violation_detector.get_event(tid)
+                        if existing_lane_event is not None and not state.is_confirmed_lane_violation:
+                            state.is_confirmed_lane_violation = True
+                            state.lane_violation_reason = existing_lane_event.reason
+                            self._confirmed_lane_violators.add(tid)
+                            self._violating_tracks.add(tid)
 
                     # Plate Detection & Recognition
                     det_result = self.plate_manager.update_track(
@@ -650,9 +766,27 @@ class PlateSpeedPipeline:
                             cv2.LINE_AA,
                         )
 
-                    # Display color & subtitle
-                    is_violating = state.is_confirmed_speeding or (eff_speed > (self._speed_limit_kmh + self._speed_tolerance_kmh))
-                    color = speed_color if is_violating else normal_color
+                    # Determine lane tag and status
+                    if state.is_confirmed_lane_violation:
+                        lane_tag = "🚨WRONG-WAY" if state.lane_violation_reason == "opposite_direction" else "🚨ENTRY-VIOL"
+                    elif inside_lane and self.lane_zone is not None:
+                        progress = self.lane_zone.progress_ratio(lane_anchor)
+                        lane_tag = f"IN:{progress:+.2f}"
+                    else:
+                        lane_tag = "OUT"
+                    state.lane_status = lane_tag
+
+                    # Determine color:
+                    # Red if speeding OR lane violation; Green if inside lane; Orange if outside lane
+                    is_speed_viol = state.is_confirmed_speeding or (eff_speed > (self._speed_limit_kmh + self._speed_tolerance_kmh))
+                    is_any_viol = is_speed_viol or state.is_confirmed_lane_violation
+
+                    if is_any_viol:
+                        color = violation_color
+                    elif inside_lane:
+                        color = normal_color
+                    else:
+                        color = out_of_lane_color
 
                     parts = []
                     if plate_bn:
@@ -663,16 +797,23 @@ class PlateSpeedPipeline:
                     if eff_speed > 0:
                         parts.append(f"{eff_speed:.0f}km/h")
 
-                    if is_violating:
+                    if is_speed_viol:
                         parts.append("🚨SPEEDING")
+
+                    parts.append(lane_tag)
 
                     subtitle = " | ".join(parts) if parts else ""
                     draw_tracked_vehicle(
                         annotated, tid, bbox, color, line_thickness, subtitle
                     )
+                    # Draw bottom anchor circle on lane
+                    cv2.circle(annotated, lane_anchor, 3, color, -1, lineType=cv2.LINE_AA)
 
                 # Handle lost tracks (vehicle exited scene) -> persist definitive record
                 for lost_id in lost_ids:
+                    if self.lane_zone is not None:
+                        self.motion_tracker.remove(lost_id)
+
                     state = self._tracks.get(lost_id)
                     plate_rec = self.plate_manager.get_record(lost_id)
                     eff_s = self.speed_estimator.get_effective_speed(lost_id)
@@ -706,6 +847,7 @@ class PlateSpeedPipeline:
                             peak_speed_kmh=peak_s,
                             is_speeding=is_viol,
                             plate_crop=p_crop,
+                            lane_violation=state.lane_violation_reason if state.is_confirmed_lane_violation else "",
                         )
                         state.saved = True
                         total_saved += 1
@@ -713,6 +855,9 @@ class PlateSpeedPipeline:
                     self._tracks.pop(lost_id, None)
                     self.plate_manager.remove_track(lost_id)
                     self.speed_estimator.remove_track(lost_id)
+
+                if self.lane_zone is not None:
+                    self.motion_tracker.cleanup(active_ids=active_ids, current_frame_idx=frame_idx)
 
                 # Persist active tracks that reach optimal close-up point (y2 >= 850 or leaving foreground)
                 for tid in active_ids:
@@ -725,7 +870,7 @@ class PlateSpeedPipeline:
                     y2 = state.last_bbox[3]
                     is_close_enough = y2 >= 850
                     eff_s = state.effective_speed_kmh
-                    is_viol = state.is_confirmed_speeding
+                    is_viol = state.is_confirmed_speeding or state.is_confirmed_lane_violation
 
                     if is_close_enough or (is_viol and state.frames_seen >= 15):
                         p_bn = plate_rec.best_plate_text if plate_rec else ""
@@ -750,13 +895,19 @@ class PlateSpeedPipeline:
                             plate_conf=p_conf,
                             speed_kmh=eff_s,
                             peak_speed_kmh=state.peak_speed_kmh,
-                            is_speeding=is_viol,
+                            is_speeding=state.is_confirmed_speeding,
                             plate_crop=p_crop,
+                            lane_violation=state.lane_violation_reason if state.is_confirmed_lane_violation else "",
                         )
                         state.saved = True
                         total_saved += 1
 
+
                 fps_value = self.fps_counter.tick()
+                total_violations = len(self._violating_tracks)
+                speed_violations = len(self._confirmed_speed_violators)
+                lane_violations = len(self._confirmed_lane_violators)
+
                 self._draw_hud(
                     annotated,
                     fps_value,
@@ -765,7 +916,9 @@ class PlateSpeedPipeline:
                     len(tracked),
                     total_saved,
                     total_plates_read,
-                    total_violations,
+                    total_violations=total_violations,
+                    speed_violations=speed_violations,
+                    lane_violations=lane_violations,
                 )
 
                 if self._video_writer:
@@ -777,13 +930,15 @@ class PlateSpeedPipeline:
                     last_progress_log = now_t
                     pct_str = f"{(frame_idx / max(1, total_source_frames)) * 100:.1f}%" if total_source_frames > 0 else "N/A"
                     logger.info(
-                        "[Progress] Frame %d/%d (%s) | FPS: %.1f | Active: %d | Violations: %d | Logged: %d",
+                        "[Progress] Frame %d/%d (%s) | FPS: %.1f | Active: %d | Violations: %d (Lane:%d, Speed:%d) | Logged: %d",
                         frame_idx,
                         total_source_frames,
                         pct_str,
                         fps_value,
                         len(tracked),
                         total_violations,
+                        lane_violations,
+                        speed_violations,
                         total_saved,
                     )
 
@@ -796,6 +951,11 @@ class PlateSpeedPipeline:
                     if (cv2.waitKey(1) & 0xFF) == ord("q"):
                         logger.info("[Pipeline] 'q' pressed — stopping.")
                         break
+
+            # Flush and shutdown background OCR worker so pending plate reads complete
+            if self.plate_manager is not None:
+                logger.info("[Pipeline] Finalizing background ALPR recognition tasks...")
+                self.plate_manager.shutdown(wait_seconds=1.5)
 
             # Save any remaining active tracks at end of footage
             for tid, state in list(self._tracks.items()):
@@ -828,6 +988,7 @@ class PlateSpeedPipeline:
                         peak_speed_kmh=peak_s,
                         is_speeding=is_viol,
                         plate_crop=p_crop,
+                        lane_violation=state.lane_violation_reason if state.is_confirmed_lane_violation else "",
                     )
                     state.saved = True
                     total_saved += 1
@@ -839,7 +1000,12 @@ class PlateSpeedPipeline:
             logger.info("=======================================================")
             logger.info("Pipeline Complete!")
             logger.info("Total Frames Processed: %d", frame_idx)
-            logger.info("Total Violations Detected: %d", total_violations)
+            logger.info(
+                "Total Violations Detected: %d (Lane: %d, Speed: %d)",
+                len(self._violating_tracks),
+                len(self._confirmed_lane_violators),
+                len(self._confirmed_speed_violators),
+            )
             logger.info("Total Events Logged: %d", total_saved)
             logger.info("Annotated Video: %s", self._video_path)
             logger.info("CSV Database: %s", self._csv_path)
@@ -861,3 +1027,51 @@ class PlateSpeedPipeline:
                 )
             except Exception as e:
                 logger.warning("[Pipeline] Could not auto-export Excel: %s", e)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Bangladeshi License Plate ALPR & Speed Estimation Pipeline",
+    )
+    parser.add_argument("source", nargs="?", default=None, help="Video source path or webcam")
+    parser.add_argument("--config", type=str, default="config.yaml", help="Path to YAML config")
+    parser.add_argument("--no-display", action="store_true", help="Disable preview window")
+    parser.add_argument("--save-video", action="store_true", help="Force save annotated video")
+    parser.add_argument("--no-save-video", action="store_true", help="Disable annotated video saving")
+    parser.add_argument("--decimation", type=int, default=None, help="Override frame decimation")
+    parser.add_argument("--fps", type=float, default=None, help="Override source FPS")
+    parser.add_argument("--max-frames", type=int, default=None, help="Stop after N frames")
+    parser.add_argument("--no-lane", action="store_true", help="Disable lane zone checks")
+    return parser.parse_args()
+
+
+def apply_cli_overrides(cfg: dict, args: argparse.Namespace) -> None:
+    if args.source is not None:
+        cfg["input"]["source"] = args.source
+    if args.no_display:
+        cfg["display"]["show_window"] = False
+    if args.save_video:
+        cfg["output"]["save_annotated_video"] = True
+    if args.no_save_video:
+        cfg["output"]["save_annotated_video"] = False
+    if args.decimation is not None:
+        cfg["input"]["frame_decimation"] = max(1, int(args.decimation))
+    if args.fps is not None and args.fps > 0:
+        cfg["input"]["force_fps"] = float(args.fps)
+
+
+def main() -> None:
+    from src.utils import load_config, setup_logging
+
+    args = parse_args()
+    cfg = load_config(args.config)
+    apply_cli_overrides(cfg, args)
+    setup_logging(cfg)
+
+    logger.info("Starting Dedicated Plate & Speed Pipeline")
+    pipeline = PlateSpeedPipeline(cfg, enable_lane=not args.no_lane)
+    pipeline.run(max_frames=args.max_frames)
+
+
+if __name__ == "__main__":
+    main()

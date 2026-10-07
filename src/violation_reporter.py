@@ -17,6 +17,7 @@ except ImportError:
     winsound = None
 
 from src.plate_detector import LicensePlateDetector, BanglaPlateOCR, PlatePreprocessor
+from src.utils import draw_bilingual_text, trigger_beep
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,8 @@ class ViolationReporter:
                 """
                 CREATE TABLE IF NOT EXISTS violations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pc_date TEXT,
+                    pc_time TEXT,
                     timestamp_sec REAL,
                     frame_idx INTEGER,
                     track_id INTEGER,
@@ -123,6 +126,32 @@ class ViolationReporter:
                     speed_kmh REAL,
                     plate_text TEXT,
                     snapshot_path TEXT
+                )
+            """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS detections (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pc_date        TEXT,
+                    pc_time        TEXT,
+                    timestamp_sec  REAL,
+                    frame_idx      INTEGER,
+                    track_id       INTEGER,
+                    plate_bn       TEXT,
+                    plate_en       TEXT,
+                    plate_conf     REAL,
+                    speed_kmh      REAL,
+                    peak_speed_kmh REAL,
+                    speeding       INTEGER,
+                    lane_violation TEXT,
+                    violation_type TEXT,
+                    x1             INTEGER,
+                    y1             INTEGER,
+                    x2             INTEGER,
+                    y2             INTEGER,
+                    plate_crop_path TEXT,
+                    snapshot_path  TEXT
                 )
             """
             )
@@ -156,6 +185,8 @@ class ViolationReporter:
 
         # Detect license plate in the vehicle snapshot
         plate_text = ""
+        plate_bn = ""
+        plate_en = ""
         best_plate_crop = None
         best_plate_conf = 0.0
 
@@ -163,10 +194,12 @@ class ViolationReporter:
             plates = self._plate_detector.detect_in_vehicle_crop(snapshot_image, (0, 0, snapshot_image.shape[1], snapshot_image.shape[0]))
             for p in plates:
                 if p.cropped_plate is not None and p.cropped_plate.size > 0:
-                    text, conf = self._plate_ocr.recognize(p.cropped_plate)
+                    text_bn, text_en, conf = self._plate_ocr.recognize(p.cropped_plate)
                     if conf > best_plate_conf:
                         best_plate_conf = conf
-                        plate_text = text
+                        plate_bn = text_bn
+                        plate_en = text_en
+                        plate_text = text_bn or text_en
                         best_plate_crop = p.cropped_plate
 
         # If a plate crop was detected, inset it on the top-right of the vehicle snapshot
@@ -218,14 +251,17 @@ class ViolationReporter:
         snapshot_path = self._snapshot_dir / snapshot_name
         cv2.imwrite(str(snapshot_path), snapshot_image)
 
-        # Beep alert sound
-        if winsound is not None:
-            def _play_beep():
-                try:
-                    winsound.Beep(1200, 250)
-                except Exception:
-                    pass
-            threading.Thread(target=_play_beep, daemon=True).start()
+        # Save standalone plate crop for offline analysis if detected
+        plate_crop_path_str = ""
+        if best_plate_crop is not None and best_plate_crop.size > 0:
+            crops_dir = self._output_dir / "plate_crops"
+            crops_dir.mkdir(parents=True, exist_ok=True)
+            crop_path = crops_dir / f"track_{event.track_id}_crop.png"
+            cv2.imwrite(str(crop_path), best_plate_crop)
+            plate_crop_path_str = str(crop_path)
+
+        # Non-blocking audio beep alert
+        trigger_beep(1200, 250)
 
         now_dt = datetime.datetime.now()
         pc_date = now_dt.strftime("%Y-%m-%d")
@@ -258,7 +294,7 @@ class ViolationReporter:
 
         if self._db_conn:
             cursor = self._db_conn.cursor()
-            # Ensure pc_date / pc_time columns exist
+            # Ensure pc_date / pc_time columns exist in legacy violations table
             cur = self._db_conn.execute("PRAGMA table_info(violations)")
             v_cols = {col[1] for col in cur.fetchall()}
             if "pc_date" not in v_cols:
@@ -286,6 +322,41 @@ class ViolationReporter:
                     str(snapshot_path),
                 ),
             )
+
+            # Also persist record to unified detections table
+            v_type = "WRONG-WAY" if event.reason == "opposite_direction" else ("ENTRY-VIOL" if event.reason == "forbidden_entry_side" else "VIOLATION")
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO detections (
+                        pc_date, pc_time, timestamp_sec, frame_idx, track_id,
+                        plate_bn, plate_en, plate_conf, speed_kmh, peak_speed_kmh,
+                        speeding, lane_violation, violation_type,
+                        plate_crop_path, snapshot_path
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        pc_date,
+                        pc_time,
+                        timestamp_sec,
+                        event.frame_idx,
+                        event.track_id,
+                        plate_bn,
+                        plate_en,
+                        best_plate_conf,
+                        speed_kmh,
+                        speed_kmh,
+                        1 if event.reason == "speeding" else 0,
+                        event.reason,
+                        v_type,
+                        plate_crop_path_str,
+                        str(snapshot_path),
+                    ),
+                )
+            except Exception as e:
+                logger.warning("[ViolationReporter] Could not insert into detections table: %s", e)
+
             self._db_conn.commit()
 
         self._saved_tracks.add(event.track_id)

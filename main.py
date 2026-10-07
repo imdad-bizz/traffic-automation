@@ -20,9 +20,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         type=str,
-        default="plate",
-        choices=["plate", "lane", "traffic_light"],
-        help="Execution mode: 'plate' (ALPR & Speed estimation), 'lane' (Lane violation with ALPR), or 'traffic_light' (Red-light violation with ALPR)",
+        default="all",
+        choices=["all", "lane", "speed", "plate", "traffic_light", "excel"],
+        help="Execution mode: 'all' (Master unified: Wrong-lane + Speed + ALPR + Excel), 'lane' (Wrong-lane only), 'speed' (Speed estimation only), 'plate' (ALPR & plate capture only), 'traffic_light' (Red light violation), or 'excel' (Generate Excel audit report)",
     )
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to YAML config")
     parser.add_argument("--no-display", action="store_true", help="Disable preview window")
@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--csv", type=str, default=None, help="Override CSV output path")
     parser.add_argument("--snapshots-dir", type=str, default=None, help="Override snapshots directory")
     parser.add_argument("--annotated-video", type=str, default=None, help="Override annotated video path")
+    parser.add_argument("--no-gpt", action="store_true", help="Disable GPT AI vision post-processing in excel mode")
 
     return parser.parse_args()
 
@@ -80,22 +81,33 @@ def main() -> None:
     logger.info("Input source: %s", cfg["input"]["source"])
     logger.info("=================================================================")
 
-    if args.mode == "plate":
+    if args.mode == "all":
         from plate_speed_pipeline import PlateSpeedPipeline
 
-        pipeline = PlateSpeedPipeline(cfg)
+        pipeline = PlateSpeedPipeline(cfg, enable_lane=True)
         pipeline.run(max_frames=args.max_frames)
 
     elif args.mode == "lane":
-        from pipeline import LaneViolationPipeline
+        from wrong_lane_violation import LaneViolationPipeline
 
         pipeline = LaneViolationPipeline(cfg)
-        pipeline.run()
+        pipeline.run(max_frames=args.max_frames)
+
+    elif args.mode == "speed":
+        from speed_violation import SpeedViolationPipeline
+
+        pipeline = SpeedViolationPipeline(cfg)
+        pipeline.run(max_frames=args.max_frames)
+
+    elif args.mode == "plate":
+        from license_plate_capture import LicensePlateCapturePipeline
+
+        pipeline = LicensePlateCapturePipeline(cfg)
+        pipeline.run(max_frames=args.max_frames)
 
     elif args.mode == "traffic_light":
         import traffic_light_violation
 
-        # Set default args expected by traffic_light_violation
         if args.csv is None:
             args.csv = cfg["paths"].get("csv_log", "outputs/traffic_light_violations.csv")
         if args.snapshots_dir is None:
@@ -104,7 +116,26 @@ def main() -> None:
             args.annotated_video = cfg["paths"].get("annotated_video", "outputs/annotated_traffic_light_violation.mp4")
 
         pipeline = traffic_light_violation.TrafficLightViolationPipeline(cfg, args)
-        pipeline.run()
+        pipeline.run(max_frames=args.max_frames)
+
+    elif args.mode == "excel":
+        from process_crops import process_all_crops
+
+        speed_cfg = cfg.get("speed", {})
+        speed_limit = float(speed_cfg.get("speed_limit_kmh", 60.0))
+        speed_tol = float(speed_cfg.get("speed_tolerance_kmh", 5.0))
+        gpt_key = cfg.get("ai", {}).get("openai_api_key") or None
+
+        excel_path = str(Path(cfg.get("paths", {}).get("output_dir", "outputs")) / "traffic_violations_alpr.xlsx")
+        process_all_crops(
+            crops_dir="outputs/plate_crops",
+            db_path=str(cfg.get("paths", {}).get("db_log", "outputs/detections.db")),
+            excel_path=excel_path,
+            speed_limit_kmh=speed_limit,
+            speed_tolerance_kmh=speed_tol,
+            use_gpt=not args.no_gpt,
+            gpt_api_key=gpt_key,
+        )
 
     logger.info("Pipeline execution completed successfully.")
 

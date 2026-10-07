@@ -110,53 +110,67 @@ def process_all_crops(
     logger.info("Harvested Crops Directory: %s", crops_dir)
     logger.info("=================================================================")
 
-    crop_files = sorted(glob.glob(os.path.join(crops_dir, "*.png")))
-    if not crop_files:
-        logger.warning("No plate crops found in %s", crops_dir)
-        return ""
-
-    logger.info("Found %d plate snapshots to process with deep OCR.", len(crop_files))
-
-    ocr = BanglaPlateOCR()
-
-    # Load speeds and metadata from SQLite if available
+    # Load speeds, violations and metadata from SQLite if available
     db_info: Dict[int, Dict[str, Any]] = {}
     db_p = Path(db_path)
     if db_p.exists():
         try:
             conn = sqlite3.connect(str(db_p))
+            conn.row_factory = sqlite3.Row
             cur = conn.cursor()
-            
-            # Check table columns
-            cur.execute("PRAGMA table_info(detections)")
-            cols = [row[1] for row in cur.fetchall()]
-            
-            query = "SELECT track_id, timestamp_sec, speed_kmh, peak_speed_kmh, snapshot_path"
-            has_pc_date = "pc_date" in cols
-            has_pc_time = "pc_time" in cols
-            if has_pc_date and has_pc_time:
-                query += ", pc_date, pc_time"
-            query += " FROM detections"
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = {row[0] for row in cur.fetchall()}
 
-            rows = cur.execute(query).fetchall()
-            for r in rows:
-                tid = int(r[0])
-                info = {
-                    "timestamp_sec": float(r[1] or 0.0),
-                    "speed_kmh": float(r[2] or 0.0),
-                    "peak_speed_kmh": float(r[3] or r[2] or 0.0),
-                    "snapshot_path": r[4] or "",
-                }
-                if has_pc_date and has_pc_time:
-                    info["pc_date"] = r[5] or ""
-                    info["pc_time"] = r[6] or ""
-                db_info[tid] = info
+            if "detections" in tables:
+                cur.execute("SELECT * FROM detections")
+                for row in cur.fetchall():
+                    d = dict(row)
+                    tid = int(d.get("track_id", 0))
+                    db_info[tid] = d
+
+            if "violations" in tables:
+                cur.execute("SELECT * FROM violations")
+                for row in cur.fetchall():
+                    d = dict(row)
+                    tid = int(d.get("track_id", 0))
+                    if tid not in db_info:
+                        v_reason = d.get("reason", "")
+                        v_type = "WRONG-WAY" if v_reason == "opposite_direction" else ("ENTRY-VIOL" if v_reason == "forbidden_entry_side" else "VIOLATION")
+                        db_info[tid] = {
+                            "track_id": tid,
+                            "timestamp_sec": float(d.get("timestamp_sec", 0.0)),
+                            "pc_date": d.get("pc_date", ""),
+                            "pc_time": d.get("pc_time", ""),
+                            "frame_idx": int(d.get("frame_idx", 0)),
+                            "plate_bn": d.get("plate_text", ""),
+                            "plate_en": "",
+                            "plate_conf": 0.85 if d.get("plate_text") else 0.0,
+                            "speed_kmh": float(d.get("speed_kmh", 0.0)),
+                            "peak_speed_kmh": float(d.get("speed_kmh", 0.0)),
+                            "speeding": 1 if v_reason == "speeding" else 0,
+                            "lane_violation": v_reason,
+                            "violation_type": v_type,
+                            "snapshot_path": d.get("snapshot_path", ""),
+                        }
             conn.close()
+            logger.info("Loaded %d detection records from SQLite database: %s", len(db_info), db_path)
         except Exception as e:
-            logger.warning("Could not read detections.db: %s", e)
+            logger.warning("Could not read detections database: %s", e)
 
+    crop_files = [
+        f for f in sorted(glob.glob(os.path.join(crops_dir, "*.png")))
+        if not f.endswith("_enhanced.png")
+    ]
+    if not crop_files and not db_info:
+        logger.warning("No plate crops found in %s and no detections in %s", crops_dir, db_path)
+        return ""
+
+    logger.info("Found %d plate snapshots to process for reporting.", len(crop_files))
+
+    ocr = BanglaPlateOCR()
     records: List[Dict[str, Any]] = []
     now_dt = datetime.datetime.now()
+    processed_tids: set[int] = set()
 
     for crop_path in crop_files:
         img = cv2.imread(crop_path)
@@ -164,9 +178,11 @@ def process_all_crops(
             continue
 
         base_name = os.path.basename(crop_path)
-        # Extract track id from file name (e.g. track_5_plate.png or track_5_frame_605.png)
         tid_match = re.search(r"track_(\d+)", base_name)
         track_id = int(tid_match.group(1)) if tid_match else 0
+        processed_tids.add(track_id)
+
+        meta = db_info.get(track_id, {})
 
         # Generate enhanced version for crystal-clear visual quality if not yet enhanced
         enhanced_crop = PlatePreprocessor.enhance_for_display(img)
@@ -174,22 +190,28 @@ def process_all_crops(
         if not os.path.exists(enhanced_path):
             cv2.imwrite(enhanced_path, enhanced_crop)
 
-        # Run deep recognition
-        bn_text, en_text, conf = deep_recognize_plate(ocr, img)
-
-        meta = db_info.get(track_id, {})
-        ts_sec = meta.get("timestamp_sec", 0.0)
-        speed = meta.get("speed_kmh", 0.0)
-        peak_speed = meta.get("peak_speed_kmh", speed)
+        # Reuse existing OCR reading if already recognized by pipeline; otherwise run deep recognition
+        if meta.get("plate_bn") and len(meta.get("plate_bn", "").strip()) >= 3:
+            bn_text = meta.get("plate_bn")
+            en_text = meta.get("plate_en", "")
+            conf = float(meta.get("plate_conf", 0.6))
+        else:
+            bn_text, en_text, conf = deep_recognize_plate(ocr, img)
+        ts_sec = float(meta.get("timestamp_sec", 0.0))
+        speed = float(meta.get("speed_kmh", 0.0))
+        peak_speed = float(meta.get("peak_speed_kmh", speed))
         snap_path = meta.get("snapshot_path", "")
         pc_date = meta.get("pc_date") or now_dt.strftime("%Y-%m-%d")
         pc_time = meta.get("pc_time") or now_dt.strftime("%H:%M:%S")
+        speeding_val = int(meta.get("speeding", 0))
+        lane_viol = meta.get("lane_violation", "")
+        v_type = meta.get("violation_type", "")
 
         logger.info(
             "Track %d: '%s' (%s) [conf: %.1f%%] Speed: %.1f km/h",
             track_id,
-            bn_text or "UNREADABLE",
-            en_text or "N/A",
+            bn_text or meta.get("plate_bn") or "UNREADABLE",
+            en_text or meta.get("plate_en") or "N/A",
             conf * 100,
             max(speed, peak_speed),
         )
@@ -200,16 +222,52 @@ def process_all_crops(
                 "timestamp_sec": ts_sec,
                 "pc_date": pc_date,
                 "pc_time": pc_time,
-                "plate_bn": bn_text,
-                "plate_en": en_text,
-                "plate_conf": conf,
+                "plate_bn": bn_text or meta.get("plate_bn", ""),
+                "plate_en": en_text or meta.get("plate_en", ""),
+                "plate_conf": conf if conf > 0 else float(meta.get("plate_conf", 0.0)),
                 "recognition_source": "EasyOCR Neural / BRTA",
                 "speed_kmh": speed,
                 "peak_speed_kmh": peak_speed,
+                "speeding": speeding_val,
+                "lane_violation": lane_viol,
+                "violation_type": v_type,
+                "reason": v_type or lane_viol,
                 "plate_crop_path": enhanced_path if os.path.exists(enhanced_path) else crop_path,
                 "snapshot_path": snap_path,
             }
         )
+
+    # Also include any detections from DB that did not have an isolated plate crop file
+    for tid, meta in db_info.items():
+        if tid not in processed_tids:
+            ts_sec = float(meta.get("timestamp_sec", 0.0))
+            speed = float(meta.get("speed_kmh", 0.0))
+            peak_speed = float(meta.get("peak_speed_kmh", speed))
+            p_crop = meta.get("plate_crop_path", "")
+            snap_path = meta.get("snapshot_path", "")
+            pc_date = meta.get("pc_date") or now_dt.strftime("%Y-%m-%d")
+            pc_time = meta.get("pc_time") or now_dt.strftime("%H:%M:%S")
+
+            records.append(
+                {
+                    "track_id": tid,
+                    "timestamp_sec": ts_sec,
+                    "pc_date": pc_date,
+                    "pc_time": pc_time,
+                    "plate_bn": meta.get("plate_bn", ""),
+                    "plate_en": meta.get("plate_en", ""),
+                    "plate_conf": float(meta.get("plate_conf", 0.0)),
+                    "recognition_source": "Standard Pipeline",
+                    "speed_kmh": speed,
+                    "peak_speed_kmh": peak_speed,
+                    "speeding": int(meta.get("speeding", 0)),
+                    "lane_violation": meta.get("lane_violation", ""),
+                    "violation_type": meta.get("violation_type", ""),
+                    "reason": meta.get("violation_type", "") or meta.get("lane_violation", ""),
+                    "plate_crop_path": p_crop,
+                    "snapshot_path": snap_path,
+                }
+            )
 
     # Sort records by track_id
     records.sort(key=lambda r: r["track_id"])

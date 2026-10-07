@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Generator, Optional
@@ -10,6 +11,28 @@ import numpy as np
 import yaml
 
 logger = logging.getLogger(__name__)
+
+_last_beep_time: float = 0.0
+_beep_lock = threading.Lock()
+
+
+def trigger_beep(frequency_hz: int = 1200, duration_ms: int = 250, min_interval_sec: float = 0.4) -> None:
+    """Trigger a non-blocking audio beep with debounced interval to prevent audio stutter."""
+    global _last_beep_time
+    now = time.time()
+    with _beep_lock:
+        if now - _last_beep_time < min_interval_sec:
+            return
+        _last_beep_time = now
+
+    def _play_sound():
+        try:
+            import winsound
+            winsound.Beep(int(frequency_hz), int(duration_ms))
+        except Exception:
+            pass
+
+    threading.Thread(target=_play_sound, daemon=True).start()
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
@@ -107,6 +130,12 @@ class FrameIngester:
     def frame_height(self) -> int:
         if self._capture and self._capture.isOpened():
             return int(self._capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        return 0
+
+    @property
+    def total_frames(self) -> int:
+        if self._capture and self._capture.isOpened():
+            return int(self._capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         return 0
 
     def _open(self) -> None:
@@ -247,11 +276,18 @@ def draw_hud(
     frame_idx: int,
     active_tracks: int,
     total_violations: int,
+    extra: Optional[dict[str, str]] = None,
 ) -> None:
-    hud = (
-        f"FPS:{fps:.1f} | Frame:{frame_idx} | Active:{active_tracks} | "
-        f"Violations:{total_violations}"
-    )
+    parts = [
+        f"FPS:{fps:.1f}",
+        f"Frame:{frame_idx}",
+        f"Active:{active_tracks}",
+        f"Violations:{total_violations}",
+    ]
+    if extra:
+        for k, v in extra.items():
+            parts.append(f"{k}:{v}")
+    hud = " | ".join(parts)
     cv2.putText(
         frame,
         hud,

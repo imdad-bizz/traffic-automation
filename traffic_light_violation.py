@@ -4,19 +4,17 @@ import argparse
 import csv
 import datetime
 import logging
+import sqlite3
 import threading
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
 
-try:
-    import winsound
-except ImportError:
-    winsound = None
-
+from src.plate_detector import LicensePlateDetector, BanglaPlateOCR
 from src.tracker import build_detector_and_tracker
 from src.utils import (
     FPSCounter,
@@ -28,8 +26,8 @@ from src.utils import (
     resize_for_display,
     resize_to_fit,
     setup_logging,
+    trigger_beep,
 )
-from src.plate_detector import LicensePlateDetector, BanglaPlateOCR
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +194,9 @@ class TrafficViolationReporter:
         self._writer: csv.DictWriter | None = None
         self._saved_track_ids: set[int] = set()
 
+        self._db_path = Path(self.cfg.get("paths", {}).get("db_log", "outputs/detections.db"))
+        self._db_conn: sqlite3.Connection | None = None
+
         self._plate_detector = None
         self._plate_ocr = None
         try:
@@ -220,6 +221,35 @@ class TrafficViolationReporter:
         if write_header:
             self._writer.writeheader()
             self._csv_file.flush()
+
+        self._db_conn = sqlite3.connect(str(self._db_path))
+        self._db_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detections (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                pc_date        TEXT,
+                pc_time        TEXT,
+                timestamp_sec  REAL,
+                frame_idx      INTEGER,
+                track_id       INTEGER,
+                plate_bn       TEXT,
+                plate_en       TEXT,
+                plate_conf     REAL,
+                speed_kmh      REAL,
+                peak_speed_kmh REAL,
+                speeding       INTEGER,
+                lane_violation TEXT,
+                violation_type TEXT,
+                x1             INTEGER,
+                y1             INTEGER,
+                x2             INTEGER,
+                y2             INTEGER,
+                plate_crop_path TEXT,
+                snapshot_path  TEXT
+            )
+        """
+        )
+        self._db_conn.commit()
 
     def _crop_vehicle(self, frame: np.ndarray, bbox: tuple[int, int, int, int], padding: int = 12) -> np.ndarray | None:
         h, w = frame.shape[:2]
@@ -247,6 +277,8 @@ class TrafficViolationReporter:
             snapshot = frame.copy()
 
         plate_text = ""
+        plate_bn = ""
+        plate_en = ""
         best_plate_crop = None
         best_plate_conf = 0.0
 
@@ -256,10 +288,12 @@ class TrafficViolationReporter:
             )
             for p in plates:
                 if p.cropped_plate is not None and p.cropped_plate.size > 0:
-                    text, conf = self._plate_ocr.recognize(p.cropped_plate)
+                    text_bn, text_en, conf = self._plate_ocr.recognize(p.cropped_plate)
                     if conf > best_plate_conf:
                         best_plate_conf = conf
-                        plate_text = text
+                        plate_bn = text_bn
+                        plate_en = text_en
+                        plate_text = text_bn or text_en
                         best_plate_crop = p.cropped_plate
 
         if best_plate_crop is not None and best_plate_crop.size > 0:
@@ -292,14 +326,17 @@ class TrafficViolationReporter:
         snapshot_path = self._snapshot_dir / snapshot_name
         cv2.imwrite(str(snapshot_path), snapshot)
 
-        # Non-blocking audio beep alert
-        if winsound is not None:
-            def _play_beep():
-                try:
-                    winsound.Beep(1200, 250)
-                except Exception:
-                    pass
-            threading.Thread(target=_play_beep, daemon=True).start()
+        # Save plate crop for offline analysis if detected
+        plate_crop_path_str = ""
+        if best_plate_crop is not None and best_plate_crop.size > 0:
+            crops_dir = self._snapshot_dir.parent / "plate_crops"
+            crops_dir.mkdir(parents=True, exist_ok=True)
+            crop_path = crops_dir / f"track_{event.track_id}_crop.png"
+            cv2.imwrite(str(crop_path), best_plate_crop)
+            plate_crop_path_str = str(crop_path)
+
+        # Non-blocking debounced audio beep alert
+        trigger_beep(1200, 250)
 
         now_dt = datetime.datetime.now()
         pc_date = now_dt.strftime("%Y-%m-%d")
@@ -323,6 +360,41 @@ class TrafficViolationReporter:
             }
         )
         self._csv_file.flush()
+
+        if self._db_conn:
+            try:
+                self._db_conn.execute(
+                    """
+                    INSERT INTO detections (
+                        pc_date, pc_time, timestamp_sec, frame_idx, track_id,
+                        plate_bn, plate_en, plate_conf, speed_kmh, peak_speed_kmh,
+                        speeding, lane_violation, violation_type,
+                        plate_crop_path, snapshot_path
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        pc_date,
+                        pc_time,
+                        event.timestamp_sec,
+                        event.frame_idx,
+                        event.track_id,
+                        plate_bn,
+                        plate_en,
+                        best_plate_conf,
+                        0.0,
+                        0.0,
+                        0,
+                        "",
+                        "RED-LIGHT",
+                        plate_crop_path_str,
+                        str(snapshot_path),
+                    ),
+                )
+                self._db_conn.commit()
+            except Exception as e:
+                logger.warning("Could not insert red-light violation to DB: %s", e)
+
         self._saved_track_ids.add(event.track_id)
 
         logger.info(
@@ -338,6 +410,9 @@ class TrafficViolationReporter:
             self._csv_file.close()
             self._csv_file = None
             self._writer = None
+        if self._db_conn is not None:
+            self._db_conn.close()
+            self._db_conn = None
 
 
 def _line_side(point: Point, line_a: Point, line_b: Point, epsilon: float = 2.0) -> int:
@@ -483,15 +558,28 @@ class TrafficLightViolationPipeline:
         self.args = args
         self._apply_vehicle_recall_tuning()
 
-        self._line_a, self._line_b = SIGNAL_LINE_POINTS
-        self._signal_strip_half_width = max(6, int(getattr(args, "strip_half_width", SIGNAL_STRIP_HALF_WIDTH_PX)))
+        tl_cfg = cfg.get("traffic_light", {})
+        raw_light_box = tl_cfg.get("light_box_points", LIGHT_BOX_POINTS)
+        self._raw_light_box = [(int(p[0]), int(p[1])) for p in raw_light_box]
+        raw_signal_line = tl_cfg.get("signal_line_points", SIGNAL_LINE_POINTS)
+        self._raw_signal_line = (
+            (int(raw_signal_line[0][0]), int(raw_signal_line[0][1])),
+            (int(raw_signal_line[1][0]), int(raw_signal_line[1][1])),
+        )
+        self._raw_strip_half_width = max(
+            6, int(getattr(args, "strip_half_width", None) or tl_cfg.get("strip_half_width", SIGNAL_STRIP_HALF_WIDTH_PX))
+        )
+        self._reference_resolution = tl_cfg.get("reference_resolution", [1280, 720])
+
+        self._line_a, self._line_b = self._raw_signal_line
+        self._signal_strip_half_width = self._raw_strip_half_width
         self._signal_strip_polygon = _build_signal_strip_polygon(
             self._line_a,
             self._line_b,
             self._signal_strip_half_width,
         )
         self._signal_strip_polygon_np = np.array(self._signal_strip_polygon, dtype=np.int32)
-        self._light_detector = LightSignalDetector(LIGHT_BOX_POINTS)
+        self._light_detector = LightSignalDetector(self._raw_light_box)
 
         self._reporter = TrafficViolationReporter(
             csv_path=Path(args.csv),
@@ -608,7 +696,7 @@ class TrafficLightViolationPipeline:
             cv2.LINE_AA,
         )
 
-    def run(self) -> None:
+    def run(self, max_frames: Optional[int] = None) -> None:
         display_cfg = self.cfg["display"]
         show_window = bool(display_cfg.get("show_window", True))
         window_name = str(display_cfg.get("window_name", "Traffic Light Violation Detection"))
@@ -622,6 +710,27 @@ class TrafficLightViolationPipeline:
         bbox_violation_color = tuple(display_cfg.get("bbox_color_violation", [0, 0, 255]))
 
         with FrameIngester(self.cfg) as ingester:
+            frame_w, frame_h = ingester.frame_width, ingester.frame_height
+            ref_w, ref_h = int(self._reference_resolution[0]), int(self._reference_resolution[1])
+            if ref_w > 0 and ref_h > 0 and (frame_w != ref_w or frame_h != ref_h):
+                sx = frame_w / float(ref_w)
+                sy = frame_h / float(ref_h)
+                scaled_light_box = [(int(round(p[0] * sx)), int(round(p[1] * sy))) for p in self._raw_light_box]
+                self._line_a = (int(round(self._raw_signal_line[0][0] * sx)), int(round(self._raw_signal_line[0][1] * sy)))
+                self._line_b = (int(round(self._raw_signal_line[1][0] * sx)), int(round(self._raw_signal_line[1][1] * sy)))
+                self._signal_strip_half_width = max(6, int(round(self._raw_strip_half_width * sx)))
+                self._signal_strip_polygon = _build_signal_strip_polygon(
+                    self._line_a,
+                    self._line_b,
+                    self._signal_strip_half_width,
+                )
+                self._signal_strip_polygon_np = np.array(self._signal_strip_polygon, dtype=np.int32)
+                self._light_detector = LightSignalDetector(scaled_light_box)
+                logger.info(
+                    "[TrafficLight] Scaled signal line and ROI to frame (%dx%d) scale=(%.3f, %.3f)",
+                    frame_w, frame_h, sx, sy,
+                )
+
             self._update_tracking_runtime_params(ingester.processing_fps)
             self._vehicle_detector, self._vehicle_tracker = build_detector_and_tracker(self.cfg)
 
@@ -638,6 +747,10 @@ class TrafficLightViolationPipeline:
                     cv2.resizeWindow(window_name, window_width, window_height)
 
             for frame_idx, timestamp_sec, frame in ingester:
+                if max_frames is not None and frame_idx >= max_frames:
+                    logger.info("Reached max_frames=%d, stopping pipeline.", max_frames)
+                    break
+
                 raw_frame = frame.copy()
 
                 detections = self._vehicle_detector.detect(frame)

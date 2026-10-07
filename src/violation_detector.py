@@ -40,7 +40,8 @@ class ViolationDetector:
         self._forbidden_entry_progress_ratio = float(vcfg["forbidden_entry_progress_ratio"])
         self._forbidden_entry_max_forward_px = float(vcfg["forbidden_entry_max_forward_px"])
         
-        # Speed params
+        # Speed params (disabled by default since SpeedEstimator handles calibrated IPM speed)
+        self._check_speed = bool(vcfg.get("check_speed", False))
         self._lane_length_meters = float(vcfg.get("lane_length_meters", 30.0))
         self._speed_limit_kmh = float(vcfg.get("speed_limit_kmh", 60.0))
         self._min_frames_for_speed = int(vcfg.get("min_frames_for_speed", 10))
@@ -64,7 +65,7 @@ class ViolationDetector:
         frame_idx: int,
         lane_zone,
         motion_tracker,
-        fps: float,
+        fps: float = 30.0,
     ) -> ViolationEvent | None:
         if track_id in self._flagged:
             return None
@@ -91,22 +92,25 @@ class ViolationDetector:
         reason: str | None = None
         speed_kmh = 0.0
 
+        # Primary violation: Opposite-direction travel inside lane polygon
         if direction_score <= self._opposite_score_threshold or progress_delta <= -self._min_progress_px:
             reason = "opposite_direction"
         else:
+            # Secondary violation: Entered near exit side (P1-P2) and moving backwards or lingering
             start_ratio = motion_tracker.get_start_progress_ratio(track_id, lane_zone)
             if (
                 start_ratio is not None
                 and start_ratio >= self._forbidden_entry_progress_ratio
                 and progress_delta <= self._forbidden_entry_max_forward_px
+                and direction_score < 0.1  # Must NOT be moving in legal forward direction
             ):
                 reason = "forbidden_entry_side"
-            elif len(inside_points) >= self._min_frames_for_speed and fps > 0:
+            elif self._check_speed and len(inside_points) >= self._min_frames_for_speed and fps > 0:
                 start_frame = motion_tracker.get_start_frame(track_id)
                 if start_frame is not None and frame_idx > start_frame:
                     time_elapsed = (frame_idx - start_frame) / fps
-                    lane_len_px = getattr(lane_zone.geometry, "length_px", 1.0) or 1.0
-                    norm_progress = abs(progress_delta) / max(1.0, float(lane_len_px))
+                    lane_len_px = float(getattr(lane_zone.geometry, "direction_length", 1.0) or 1.0)
+                    norm_progress = abs(progress_delta) / max(1.0, lane_len_px)
                     dist_meters = norm_progress * self._lane_length_meters
                     if time_elapsed > 0.2 and dist_meters > 2.0:
                         speed_ms = dist_meters / time_elapsed
