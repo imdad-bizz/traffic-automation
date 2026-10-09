@@ -95,13 +95,19 @@ lane_zone:
   #   - [2000, 500]
   #   - [1600, 400]
   # cctv_footage.mp4
-  reference_resolution: [2046, 1080]
+  # reference_resolution: [2046, 1080]
+  # points:
+  #   - [280, 950]
+  #   - [2000, 950]
+  #   - [1500, 150]
+  #   - [750, 150]
+ # morning_sun_wronglane.mp4
+  reference_resolution: [1440, 1080]
   points:
-    - [280, 950]
-    - [2000, 950]
-    - [1500, 150]
-    - [750, 150]
-
+    - [550, 300]
+    - [750, 280]
+    - [1400, 700]
+    - [740, 950]
 
 motion:
   history_size: 20
